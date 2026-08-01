@@ -19,8 +19,9 @@ Options:
                                  stat line, just not full charts — mixing
                                  currencies into one number is never done
     --out-dir PATH                default ~/Documents/MyFinance
-    --refresh                    ignore an existing cache file for this
-                                 exact institutions+range and re-fetch live
+    --refresh                    ignore existing per-month cache files
+                                 covering this range and re-fetch all of
+                                 them live
 
 See SKILL.md in this directory for the full write-up (categorization rules,
 cache-reuse policy, known gotchas).
@@ -136,24 +137,67 @@ def resolve_institutions(store: BankCredentialStore, requested: list[str] | None
     return resolved
 
 
+BALANCE_CACHE_TTL_MINUTES = 60
+
+
+def _balance_cache_path(data_dir: Path) -> Path:
+    return data_dir / "balance_cache.json"
+
+
+def _load_balance_cache(data_dir: Path) -> dict[str, Any]:
+    path = _balance_cache_path(data_dir)
+    if path.exists():
+        return json.loads(path.read_text())
+    return {}
+
+
+def _cached_balance_fresh_enough(entry: dict[str, Any]) -> bool:
+    fetched_at = datetime.fromisoformat(entry["fetched_at"])
+    age_minutes = (datetime.now(UTC) - fetched_at).total_seconds() / 60
+    return age_minutes < BALANCE_CACHE_TTL_MINUTES
+
+
 def fetch_balance_total(
-    store: BankCredentialStore, dataset: dict[str, Any], currency: str
+    store: BankCredentialStore,
+    dataset: dict[str, Any],
+    currency: str,
+    data_dir: Path,
+    refresh: bool = False,
 ) -> tuple[float, list[str]]:
-    """Live balance lookup (always fresh, never cached) for every account of
-    `currency` across the institutions in `dataset`. One account failing
-    (expired session, rate limit, ...) doesn't block the rest — it's
-    reported as a warning and skipped."""
+    """Balance lookup for every account of `currency` across the
+    institutions in `dataset` — live, but reused from a short-lived local
+    cache (BALANCE_CACHE_TTL_MINUTES) per account rather than re-fetched on
+    every single run. Balances don't need second-by-second freshness for a
+    personal "balance in hand" figure, and Enable Banking enforces a daily
+    (not short-term) per-consent access cap, so an avoidable repeat call
+    can burn the whole day's quota for that institution — pass
+    `refresh=True` (from --refresh) to force a live re-fetch regardless of
+    cache age. One account failing (expired session, rate limit, ...)
+    doesn't block the rest — it's reported as a warning and skipped."""
+    cache = _load_balance_cache(data_dir)
     total = 0.0
     warnings: list[str] = []
     for institution, accounts in dataset["accounts"].items():
         for account in accounts:
             if account["currency"] != currency:
                 continue
-            try:
-                balances = enable_banking.get_balance(store, institution, account["uid"])
-            except Exception as exc:  # noqa: BLE001 - report, don't let one account sink the report
-                warnings.append(f"{institution}/{account['name']}: {type(exc).__name__}: {exc}")
-                continue
+            cache_key = f"{institution}:{account['uid']}"
+            cached = cache.get(cache_key)
+            if cached and not refresh and _cached_balance_fresh_enough(cached):
+                print(f"Using cached balance: {cache_key}")
+                balances = cached["balances"]
+            else:
+                try:
+                    balances = enable_banking.get_balance(store, institution, account["uid"])
+                except Exception as exc:  # noqa: BLE001 - report, don't sink the rest
+                    warnings.append(
+                        f"{institution}/{account['name']}: {type(exc).__name__}: {exc}"
+                    )
+                    continue
+                cache[cache_key] = {
+                    "balances": balances,
+                    "fetched_at": datetime.now(UTC).isoformat(),
+                }
             chosen = None
             for btype in _BALANCE_TYPE_PREFERENCE:
                 chosen = next((b for b in balances if b["type"] == btype), None)
@@ -163,6 +207,7 @@ def fetch_balance_total(
                 chosen = balances[0]
             if chosen and chosen.get("amount") is not None:
                 total += float(chosen["amount"])
+    _balance_cache_path(data_dir).write_text(json.dumps(cache, indent=2))
     return round(total, 2), warnings
 
 
@@ -230,6 +275,48 @@ def build_dataset(
         "institutions": institutions,
         "accounts": accounts_by_institution,
         "transactions": transactions_by_institution,
+    }
+
+
+def _full_month_cache_path(data_dir: Path, window_from: str, window_to: str) -> Path | None:
+    """Cache path for a `_month_windows` window, or None if it isn't a full
+    calendar month (a partial month's data must never be cached under the
+    same key as the full month's — it would silently corrupt future lookups
+    for that month)."""
+    start = date.fromisoformat(window_from)
+    end = date.fromisoformat(window_to)
+    last_day = calendar.monthrange(start.year, start.month)[1]
+    if start.day != 1 or end.day != last_day:
+        return None
+    return data_dir / f"{start.strftime('%Y-%m')}-transactions.json"
+
+
+def _merge_datasets(
+    parts: list[dict[str, Any]], date_from: str, date_to: str
+) -> dict[str, Any]:
+    """Combine one dataset per calendar-month window (each already deduped
+    and sorted internally) into a single dataset spanning the full
+    originally-requested range."""
+    accounts: dict[str, list[dict[str, Any]]] = {}
+    transactions: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    institutions: list[str] = []
+    for part in parts:
+        for institution in part["institutions"]:
+            if institution not in institutions:
+                institutions.append(institution)
+        accounts.update(part["accounts"])
+        for institution, txns in part["transactions"].items():
+            transactions[institution].extend(txns)
+    for institution in transactions:
+        transactions[institution].sort(key=lambda t: t["date"])
+
+    return {
+        "generated_at": datetime.now(UTC).date().isoformat(),
+        "source": "Enable Banking via jb_gateway_mcp (direct adapter call, not MCP protocol)",
+        "period": {"from": date_from, "to": date_to},
+        "institutions": institutions,
+        "accounts": accounts,
+        "transactions": dict(transactions),
     }
 
 
@@ -593,7 +680,7 @@ def render_html(
     <div class="kpi">
       <div class="label">Balance in hand (now)</div>
       <div class="value">{balance_total:,.0f} {currency}</div>
-      <div class="delta">Live, not from the {focus} snapshot</div>
+      <div class="delta">Current (within {BALANCE_CACHE_TTL_MINUTES}min), not from the {focus} snapshot</div>
     </div>"""
     balance_note = ""
     if balance_warnings:
@@ -809,14 +896,22 @@ def main(argv: list[str] | None = None) -> int:
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     label = _label_for_range(args.date_from, args.date_to)
-    data_path = data_dir / f"{label}-transactions.json"
+    windows = _month_windows(args.date_from, args.date_to)
+    window_cache_paths = [
+        (w_from, w_to, _full_month_cache_path(data_dir, w_from, w_to)) for w_from, w_to in windows
+    ]
 
     store = BankCredentialStore()
 
-    if data_path.exists() and not args.refresh:
-        print(f"Using cached data: {data_path}")
-        dataset = json.loads(data_path.read_text())
-    else:
+    # Only resolve institutions / touch the network if at least one window
+    # actually needs a live fetch — a request fully covered by per-month
+    # caches (the common case for a range you've already reported on before)
+    # never has to reach the API at all.
+    needs_live_fetch = args.refresh or any(
+        cache_path is None or not cache_path.exists() for _, _, cache_path in window_cache_paths
+    )
+    institutions: list[str] = []
+    if needs_live_fetch:
         try:
             store.get_app_credential()
         except BankCredentialNotFoundError:
@@ -831,9 +926,16 @@ def main(argv: list[str] | None = None) -> int:
         if not institutions:
             print("No connected institutions with a valid session.", file=sys.stderr)
             return 1
-        print(f"Fetching live: {', '.join(institutions)} for {args.date_from}..{args.date_to}")
+
+    parts: list[dict[str, Any]] = []
+    for w_from, w_to, cache_path in window_cache_paths:
+        if cache_path is not None and cache_path.exists() and not args.refresh:
+            print(f"Using cached data: {cache_path}")
+            parts.append(json.loads(cache_path.read_text()))
+            continue
+        print(f"Fetching live: {', '.join(institutions)} for {w_from}..{w_to}")
         try:
-            dataset = build_dataset(store, institutions, args.date_from, args.date_to)
+            part = build_dataset(store, institutions, w_from, w_to)
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 429:
                 print(
@@ -843,8 +945,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 1
             raise
-        data_path.write_text(json.dumps(dataset, indent=2))
-        print(f"Wrote data cache: {data_path}")
+        if cache_path is not None:
+            cache_path.write_text(json.dumps(part, indent=2))
+            print(f"Wrote month cache: {cache_path}")
+        parts.append(part)
+
+    dataset = _merge_datasets(parts, args.date_from, args.date_to)
 
     monthly = monthly_summaries_by_currency(dataset)
     if args.currency not in monthly:
@@ -862,7 +968,9 @@ def main(argv: list[str] | None = None) -> int:
     balance_total: float | None = None
     balance_warnings: list[str] = []
     if not args.skip_balance:
-        balance_total, balance_warnings = fetch_balance_total(store, dataset, args.currency)
+        balance_total, balance_warnings = fetch_balance_total(
+            store, dataset, args.currency, data_dir, refresh=args.refresh
+        )
         for warning in balance_warnings:
             print(f"  [balance warning] {warning}", file=sys.stderr)
 

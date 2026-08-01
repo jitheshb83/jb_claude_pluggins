@@ -30,9 +30,22 @@ against live data.
 
 `scripts/generate_report.py`:
 
-1. **Checks the cache first.** If `~/Documents/MyFinance/data/<label>-transactions.json`
-   already exists for the exact requested range, reuses it — no API call.
-   Pass `--refresh` to force a live re-fetch.
+1. **Checks the cache first, per calendar month.** The requested range is
+   split into calendar-month windows; any month that already has
+   `~/Documents/MyFinance/data/<YYYY-MM>-transactions.json` is read from
+   there — no API call — and only genuinely missing months are fetched
+   live (each newly-fetched full month gets its own cache file too, so a
+   later overlapping request reuses it). A partial month (range doesn't
+   start on the 1st / end on the last day) is never cached under a month
+   key — caching a partial slice there would silently corrupt later
+   lookups for that month — so it's always fetched fresh. Pass `--refresh`
+   to ignore all cache files for this run and re-fetch every month live.
+   This matters in practice: Enable Banking enforces a **daily**
+   per-consent access cap (PSD2 "consented multiplicity without PSU
+   involvement per day"), not a short burst limit — a 429 here means
+   today's quota for that institution is spent, not "wait a few minutes."
+   Reusing already-fetched months is the only way to avoid re-hitting it
+   for data you already have.
 2. **Otherwise fetches live**, directly via the stored Enable Banking
    credentials (same pattern as `connect-bank-account/scripts/check_bank_status.py`
    — imports `jb_gateway_mcp.adapters.enable_banking` and calls it directly,
@@ -51,10 +64,16 @@ against live data.
 5. **Flags signals**: any expense category that stopped, newly appeared, or
    moved ≥15% month over month — purely rule-based, no LLM judgment baked
    into the script.
-6. **Fetches live balance** ("balance in hand") for every account in the
-   requested currency — always a fresh call, never read from the cached
-   transaction snapshot, since a balance is inherently "right now," not
-   history. One account failing (expired session, rate limit) prints a
+6. **Fetches balance** ("balance in hand") for every account in the
+   requested currency — never read from the cached transaction snapshot,
+   since a balance is inherently "right now," not history, but reused from
+   a short-lived per-account cache (`data/balance_cache.json`,
+   `BALANCE_CACHE_TTL_MINUTES` = 60) rather than re-fetched live on every
+   run — a personal balance figure doesn't need second-by-second
+   freshness, and re-fetching it needlessly eats into the same daily
+   per-institution quota transactions do. `--refresh` forces a live
+   re-fetch regardless of cache age (same flag that forces transactions to
+   re-fetch). One account failing (expired session, rate limit) prints a
    warning and is excluded from the total rather than failing the whole
    report; skip this step entirely with `--skip-balance`.
 7. **Updates a persisted forecast model** (`scripts/forecast.py`) — see
@@ -120,7 +139,7 @@ Options:
 | `--institutions dnb,nordea` | every institution with a valid stored session | comma-separated aliases from `connect-bank-account` |
 | `--currency NOK` | `NOK` | which currency's accounts get charted; others are still fetched/cached and get a one-line footnote — currencies are never summed together |
 | `--out-dir PATH` | `~/Documents/MyFinance` | override for testing |
-| `--refresh` | off | ignore an existing cache file for this exact institutions+range, re-fetch live |
+| `--refresh` | off | ignore every per-month transaction cache file this range touches AND the balance cache, re-fetch everything live |
 | `--skip-balance` | off | skip the live "balance in hand" lookup — useful if you're rate-limited or just want the cached-only report faster |
 
 For a single calendar month, `--from`/`--to` should span the 1st to the
@@ -130,13 +149,16 @@ range, with earlier months providing trend context in the charts.
 
 ## Filename convention
 
-- Data: `data/<label>-transactions.json`
+- Data (cache, one file per calendar month, shared across every report that
+  covers that month): `data/<YYYY-MM>-transactions.json`
+- Balance cache (per account, `BALANCE_CACHE_TTL_MINUTES`-old entries are
+  still reused): `data/balance_cache.json`
 - Forecast model (persists across runs, one per currency, not per period):
   `data/forecast_model_<currency>.json`
 - Report: `reports/<label>-<institutions>-report.html`
-- `<label>` is `YYYY-MM` for one full calendar month, `YYYY-MM_to_YYYY-MM`
-  for several full calendar months, or the literal ISO dates if the range
-  isn't month-aligned.
+- `<label>` (report filenames only, not the data cache) is `YYYY-MM` for one
+  full calendar month, `YYYY-MM_to_YYYY-MM` for several full calendar
+  months, or the literal ISO dates if the range isn't month-aligned.
 
 ## Automating it monthly (launchd)
 
