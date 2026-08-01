@@ -137,24 +137,67 @@ def resolve_institutions(store: BankCredentialStore, requested: list[str] | None
     return resolved
 
 
+BALANCE_CACHE_TTL_MINUTES = 20
+
+
+def _balance_cache_path(data_dir: Path) -> Path:
+    return data_dir / "balance_cache.json"
+
+
+def _load_balance_cache(data_dir: Path) -> dict[str, Any]:
+    path = _balance_cache_path(data_dir)
+    if path.exists():
+        return json.loads(path.read_text())
+    return {}
+
+
+def _cached_balance_fresh_enough(entry: dict[str, Any]) -> bool:
+    fetched_at = datetime.fromisoformat(entry["fetched_at"])
+    age_minutes = (datetime.now(UTC) - fetched_at).total_seconds() / 60
+    return age_minutes < BALANCE_CACHE_TTL_MINUTES
+
+
 def fetch_balance_total(
-    store: BankCredentialStore, dataset: dict[str, Any], currency: str
+    store: BankCredentialStore,
+    dataset: dict[str, Any],
+    currency: str,
+    data_dir: Path,
+    refresh: bool = False,
 ) -> tuple[float, list[str]]:
-    """Live balance lookup (always fresh, never cached) for every account of
-    `currency` across the institutions in `dataset`. One account failing
-    (expired session, rate limit, ...) doesn't block the rest — it's
-    reported as a warning and skipped."""
+    """Balance lookup for every account of `currency` across the
+    institutions in `dataset` — live, but reused from a short-lived local
+    cache (BALANCE_CACHE_TTL_MINUTES) per account rather than re-fetched on
+    every single run. Balances don't need second-by-second freshness for a
+    personal "balance in hand" figure, and Enable Banking enforces a daily
+    (not short-term) per-consent access cap, so an avoidable repeat call
+    can burn the whole day's quota for that institution — pass
+    `refresh=True` (from --refresh) to force a live re-fetch regardless of
+    cache age. One account failing (expired session, rate limit, ...)
+    doesn't block the rest — it's reported as a warning and skipped."""
+    cache = _load_balance_cache(data_dir)
     total = 0.0
     warnings: list[str] = []
     for institution, accounts in dataset["accounts"].items():
         for account in accounts:
             if account["currency"] != currency:
                 continue
-            try:
-                balances = enable_banking.get_balance(store, institution, account["uid"])
-            except Exception as exc:  # noqa: BLE001 - report, don't let one account sink the report
-                warnings.append(f"{institution}/{account['name']}: {type(exc).__name__}: {exc}")
-                continue
+            cache_key = f"{institution}:{account['uid']}"
+            cached = cache.get(cache_key)
+            if cached and not refresh and _cached_balance_fresh_enough(cached):
+                print(f"Using cached balance: {cache_key}")
+                balances = cached["balances"]
+            else:
+                try:
+                    balances = enable_banking.get_balance(store, institution, account["uid"])
+                except Exception as exc:  # noqa: BLE001 - report, don't sink the rest
+                    warnings.append(
+                        f"{institution}/{account['name']}: {type(exc).__name__}: {exc}"
+                    )
+                    continue
+                cache[cache_key] = {
+                    "balances": balances,
+                    "fetched_at": datetime.now(UTC).isoformat(),
+                }
             chosen = None
             for btype in _BALANCE_TYPE_PREFERENCE:
                 chosen = next((b for b in balances if b["type"] == btype), None)
@@ -164,6 +207,7 @@ def fetch_balance_total(
                 chosen = balances[0]
             if chosen and chosen.get("amount") is not None:
                 total += float(chosen["amount"])
+    _balance_cache_path(data_dir).write_text(json.dumps(cache, indent=2))
     return round(total, 2), warnings
 
 
@@ -636,7 +680,7 @@ def render_html(
     <div class="kpi">
       <div class="label">Balance in hand (now)</div>
       <div class="value">{balance_total:,.0f} {currency}</div>
-      <div class="delta">Live, not from the {focus} snapshot</div>
+      <div class="delta">Current (within {BALANCE_CACHE_TTL_MINUTES}min), not from the {focus} snapshot</div>
     </div>"""
     balance_note = ""
     if balance_warnings:
@@ -924,7 +968,9 @@ def main(argv: list[str] | None = None) -> int:
     balance_total: float | None = None
     balance_warnings: list[str] = []
     if not args.skip_balance:
-        balance_total, balance_warnings = fetch_balance_total(store, dataset, args.currency)
+        balance_total, balance_warnings = fetch_balance_total(
+            store, dataset, args.currency, data_dir, refresh=args.refresh
+        )
         for warning in balance_warnings:
             print(f"  [balance warning] {warning}", file=sys.stderr)
 

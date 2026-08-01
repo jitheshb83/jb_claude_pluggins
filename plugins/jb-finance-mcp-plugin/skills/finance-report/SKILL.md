@@ -64,10 +64,16 @@ against live data.
 5. **Flags signals**: any expense category that stopped, newly appeared, or
    moved ≥15% month over month — purely rule-based, no LLM judgment baked
    into the script.
-6. **Fetches live balance** ("balance in hand") for every account in the
-   requested currency — always a fresh call, never read from the cached
-   transaction snapshot, since a balance is inherently "right now," not
-   history. One account failing (expired session, rate limit) prints a
+6. **Fetches balance** ("balance in hand") for every account in the
+   requested currency — never read from the cached transaction snapshot,
+   since a balance is inherently "right now," not history, but reused from
+   a short-lived per-account cache (`data/balance_cache.json`,
+   `BALANCE_CACHE_TTL_MINUTES` = 20) rather than re-fetched live on every
+   run — a personal balance figure doesn't need second-by-second
+   freshness, and re-fetching it needlessly eats into the same daily
+   per-institution quota transactions do. `--refresh` forces a live
+   re-fetch regardless of cache age (same flag that forces transactions to
+   re-fetch). One account failing (expired session, rate limit) prints a
    warning and is excluded from the total rather than failing the whole
    report; skip this step entirely with `--skip-balance`.
 7. **Updates a persisted forecast model** (`scripts/forecast.py`) — see
@@ -133,7 +139,7 @@ Options:
 | `--institutions dnb,nordea` | every institution with a valid stored session | comma-separated aliases from `connect-bank-account` |
 | `--currency NOK` | `NOK` | which currency's accounts get charted; others are still fetched/cached and get a one-line footnote — currencies are never summed together |
 | `--out-dir PATH` | `~/Documents/MyFinance` | override for testing |
-| `--refresh` | off | ignore every per-month cache file this range touches, re-fetch all of them live |
+| `--refresh` | off | ignore every per-month transaction cache file this range touches AND the balance cache, re-fetch everything live |
 | `--skip-balance` | off | skip the live "balance in hand" lookup — useful if you're rate-limited or just want the cached-only report faster |
 
 For a single calendar month, `--from`/`--to` should span the 1st to the
@@ -145,6 +151,8 @@ range, with earlier months providing trend context in the charts.
 
 - Data (cache, one file per calendar month, shared across every report that
   covers that month): `data/<YYYY-MM>-transactions.json`
+- Balance cache (per account, `BALANCE_CACHE_TTL_MINUTES`-old entries are
+  still reused): `data/balance_cache.json`
 - Forecast model (persists across runs, one per currency, not per period):
   `data/forecast_model_<currency>.json`
 - Report: `reports/<label>-<institutions>-report.html`
