@@ -68,7 +68,7 @@ against live data.
    requested currency — never read from the cached transaction snapshot,
    since a balance is inherently "right now," not history, but reused from
    a short-lived per-account cache (`data/balance_cache.json`,
-   `BALANCE_CACHE_TTL_MINUTES` = 20) rather than re-fetched live on every
+   `BALANCE_CACHE_TTL_MINUTES` = 60) rather than re-fetched live on every
    run — a personal balance figure doesn't need second-by-second
    freshness, and re-fetching it needlessly eats into the same daily
    per-institution quota transactions do. `--refresh` forces a live

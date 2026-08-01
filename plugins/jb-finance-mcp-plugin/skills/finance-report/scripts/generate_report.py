@@ -137,7 +137,7 @@ def resolve_institutions(store: BankCredentialStore, requested: list[str] | None
     return resolved
 
 
-BALANCE_CACHE_TTL_MINUTES = 20
+BALANCE_CACHE_TTL_MINUTES = 60
 
 
 def _balance_cache_path(data_dir: Path) -> Path:
