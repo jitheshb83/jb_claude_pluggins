@@ -19,8 +19,9 @@ Options:
                                  stat line, just not full charts — mixing
                                  currencies into one number is never done
     --out-dir PATH                default ~/Documents/MyFinance
-    --refresh                    ignore an existing cache file for this
-                                 exact institutions+range and re-fetch live
+    --refresh                    ignore existing per-month cache files
+                                 covering this range and re-fetch all of
+                                 them live
 
 See SKILL.md in this directory for the full write-up (categorization rules,
 cache-reuse policy, known gotchas).
@@ -230,6 +231,48 @@ def build_dataset(
         "institutions": institutions,
         "accounts": accounts_by_institution,
         "transactions": transactions_by_institution,
+    }
+
+
+def _full_month_cache_path(data_dir: Path, window_from: str, window_to: str) -> Path | None:
+    """Cache path for a `_month_windows` window, or None if it isn't a full
+    calendar month (a partial month's data must never be cached under the
+    same key as the full month's — it would silently corrupt future lookups
+    for that month)."""
+    start = date.fromisoformat(window_from)
+    end = date.fromisoformat(window_to)
+    last_day = calendar.monthrange(start.year, start.month)[1]
+    if start.day != 1 or end.day != last_day:
+        return None
+    return data_dir / f"{start.strftime('%Y-%m')}-transactions.json"
+
+
+def _merge_datasets(
+    parts: list[dict[str, Any]], date_from: str, date_to: str
+) -> dict[str, Any]:
+    """Combine one dataset per calendar-month window (each already deduped
+    and sorted internally) into a single dataset spanning the full
+    originally-requested range."""
+    accounts: dict[str, list[dict[str, Any]]] = {}
+    transactions: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    institutions: list[str] = []
+    for part in parts:
+        for institution in part["institutions"]:
+            if institution not in institutions:
+                institutions.append(institution)
+        accounts.update(part["accounts"])
+        for institution, txns in part["transactions"].items():
+            transactions[institution].extend(txns)
+    for institution in transactions:
+        transactions[institution].sort(key=lambda t: t["date"])
+
+    return {
+        "generated_at": datetime.now(UTC).date().isoformat(),
+        "source": "Enable Banking via jb_gateway_mcp (direct adapter call, not MCP protocol)",
+        "period": {"from": date_from, "to": date_to},
+        "institutions": institutions,
+        "accounts": accounts,
+        "transactions": dict(transactions),
     }
 
 
@@ -809,14 +852,22 @@ def main(argv: list[str] | None = None) -> int:
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     label = _label_for_range(args.date_from, args.date_to)
-    data_path = data_dir / f"{label}-transactions.json"
+    windows = _month_windows(args.date_from, args.date_to)
+    window_cache_paths = [
+        (w_from, w_to, _full_month_cache_path(data_dir, w_from, w_to)) for w_from, w_to in windows
+    ]
 
     store = BankCredentialStore()
 
-    if data_path.exists() and not args.refresh:
-        print(f"Using cached data: {data_path}")
-        dataset = json.loads(data_path.read_text())
-    else:
+    # Only resolve institutions / touch the network if at least one window
+    # actually needs a live fetch — a request fully covered by per-month
+    # caches (the common case for a range you've already reported on before)
+    # never has to reach the API at all.
+    needs_live_fetch = args.refresh or any(
+        cache_path is None or not cache_path.exists() for _, _, cache_path in window_cache_paths
+    )
+    institutions: list[str] = []
+    if needs_live_fetch:
         try:
             store.get_app_credential()
         except BankCredentialNotFoundError:
@@ -831,9 +882,16 @@ def main(argv: list[str] | None = None) -> int:
         if not institutions:
             print("No connected institutions with a valid session.", file=sys.stderr)
             return 1
-        print(f"Fetching live: {', '.join(institutions)} for {args.date_from}..{args.date_to}")
+
+    parts: list[dict[str, Any]] = []
+    for w_from, w_to, cache_path in window_cache_paths:
+        if cache_path is not None and cache_path.exists() and not args.refresh:
+            print(f"Using cached data: {cache_path}")
+            parts.append(json.loads(cache_path.read_text()))
+            continue
+        print(f"Fetching live: {', '.join(institutions)} for {w_from}..{w_to}")
         try:
-            dataset = build_dataset(store, institutions, args.date_from, args.date_to)
+            part = build_dataset(store, institutions, w_from, w_to)
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 429:
                 print(
@@ -843,8 +901,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 1
             raise
-        data_path.write_text(json.dumps(dataset, indent=2))
-        print(f"Wrote data cache: {data_path}")
+        if cache_path is not None:
+            cache_path.write_text(json.dumps(part, indent=2))
+            print(f"Wrote month cache: {cache_path}")
+        parts.append(part)
+
+    dataset = _merge_datasets(parts, args.date_from, args.date_to)
 
     monthly = monthly_summaries_by_currency(dataset)
     if args.currency not in monthly:
