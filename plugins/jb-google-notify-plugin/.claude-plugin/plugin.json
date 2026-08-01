@@ -3,6 +3,11 @@
   "description": "Google account onboarding and report/notification delivery via Gmail for jb_gateway_mcp.",
   "version": "0.1.0",
   "author": {
-    "name": "Jithesh Bharathan"
-  }
+    "name": "Jithesh Bharathan",
+    "url": "https://github.com/jitheshb83"
+  },
+  "homepage": "https://github.com/jitheshb83/jb_claude_pluggins/tree/main/plugins/jb-google-notify-plugin",
+  "repository": "https://github.com/jitheshb83/jb_claude_pluggins",
+  "license": "MIT",
+  "keywords": ["google", "gmail", "notifications", "oauth", "jb-gateway-mcp"]
 }
