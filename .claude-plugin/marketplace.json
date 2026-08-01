@@ -1,0 +1,20 @@
+{
+  "name": "jb-claude-plugins",
+  "owner": {
+    "name": "Jithesh Bharathan",
+    "url": "https://github.com/jitheshb83"
+  },
+  "description": "Skills and agents for jb_gateway_mcp — install jb_gateway_mcp standalone first (see its README), then install the plugin(s) you need from here.",
+  "plugins": [
+    {
+      "name": "jb-finance-mcp-plugin",
+      "source": "./plugins/jb-finance-mcp-plugin",
+      "description": "Bank account onboarding (DNB, Nordea, Revolut via Enable Banking) and local HTML finance-report generation for jb_gateway_mcp."
+    },
+    {
+      "name": "jb-google-notify-plugin",
+      "source": "./plugins/jb-google-notify-plugin",
+      "description": "Google account onboarding and report/notification delivery via Gmail for jb_gateway_mcp."
+    }
+  ]
+}

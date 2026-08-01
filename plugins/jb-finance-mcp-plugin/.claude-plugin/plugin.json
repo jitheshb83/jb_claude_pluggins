@@ -1,0 +1,8 @@
+{
+  "name": "jb-finance-mcp-plugin",
+  "description": "Bank account onboarding (DNB, Nordea, Revolut via Enable Banking) and local HTML finance-report generation for jb_gateway_mcp.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Jithesh Bharathan"
+  }
+}

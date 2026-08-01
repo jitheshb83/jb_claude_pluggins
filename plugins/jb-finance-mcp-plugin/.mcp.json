@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "jb-gateway-mcp": {
+      "command": "jb-gateway-mcp",
+      "env": {
+        "JB_GATEWAY_CALLER_ID": "local"
+      }
+    }
+  }
+}

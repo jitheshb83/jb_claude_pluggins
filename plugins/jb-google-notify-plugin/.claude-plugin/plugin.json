@@ -1,0 +1,8 @@
+{
+  "name": "jb-google-notify-plugin",
+  "description": "Google account onboarding and report/notification delivery via Gmail for jb_gateway_mcp.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Jithesh Bharathan"
+  }
+}
