@@ -1,0 +1,12 @@
+[project]
+name = "jb-finance-mcp-plugin"
+version = "0.1.0"
+description = "Skill scripts for jb-finance-mcp-plugin — depends on jb_gateway_mcp as a library."
+requires-python = ">=3.13"
+dependencies = [
+    "jb-gateway-mcp @ git+https://github.com/jitheshb83/jb_gateway_mcp.git",
+    "httpx>=0.28.1",
+]
+
+[tool.uv]
+package = false

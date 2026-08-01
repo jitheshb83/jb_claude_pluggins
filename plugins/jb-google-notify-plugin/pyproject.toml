@@ -1,0 +1,11 @@
+[project]
+name = "jb-google-notify-plugin"
+version = "0.1.0"
+description = "Skill scripts for jb-google-notify-plugin — depends on jb_gateway_mcp as a library."
+requires-python = ">=3.13"
+dependencies = [
+    "jb-gateway-mcp @ git+https://github.com/jitheshb83/jb_gateway_mcp.git",
+]
+
+[tool.uv]
+package = false
