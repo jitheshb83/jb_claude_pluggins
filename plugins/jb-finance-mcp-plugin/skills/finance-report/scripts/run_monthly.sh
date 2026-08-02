@@ -25,7 +25,7 @@ UV_BIN="${UV_BIN:-$HOME/.local/bin/uv}"
 OUT_DIR="$HOME/Documents/MyFinance"
 LOG_DIR="$OUT_DIR/logs"
 CURRENCY="NOK"
-INSTITUTIONS="dnb,nordea"
+INSTITUTIONS="dnb,nordea,revolut"
 
 # Notification addresses — edit these for your own setup, or set them via
 # environment before invoking this script (e.g. from the launchd plist).

@@ -81,6 +81,65 @@ against live data.
    the report's focus month.
 8. **Renders** the HTML report and writes both files under
    `~/Documents/MyFinance/{data,reports}/`.
+9. **Adds a "Loan details" card** from a manually-maintained Loan Tracker
+   Google Sheet (`scripts/loans.py`) — see "Loan details" below. Purely
+   informational: it never changes the forecast model or the Predicted
+   card's numbers, only adds a cross-reference note next to a matching
+   category's prediction.
+
+## Loan details
+
+Enable Banking (this skill's only bank data source) doesn't expose loan or
+mortgage accounts — PSD2's Account Information Service scope is legally
+limited to payment accounts, confirmed live against this user's own DNB/
+Nordea consents (see jb_gateway_mcp's project memory "Loan Tracker sheet"
+for the full investigation). Loan/financing details are instead tracked by
+hand in a Google Sheet and read via `scripts/loans.py`:
+
+- Cached locally at `~/Documents/MyFinance/data/loan_tracker_cache.json`
+  for **1 day** — a repeat run within that window never calls the Drive
+  API, matching the `balance_cache.json` pattern above. Pass
+  `--refresh-loans` to force a live re-fetch regardless of cache age.
+- `--loan-sheet-account`/`--loan-sheet-id` only need to be passed once (or
+  whenever they change) — once cached, later runs reuse the stored
+  `source_account`/`source_file_id` automatically.
+- Deliberately calls Drive's export endpoint directly with
+  `mimeType="text/csv"` rather than going through
+  `jb_gateway_mcp.adapters.google_drive.read_file` — that function
+  hardcodes `text/plain`, which Drive's export API rejects for
+  spreadsheets specifically (400 "requested conversion is not supported").
+  `text/csv` is the correct format there, and only ever returns the
+  sheet's first/active tab.
+- The sheet's own number/date formatting (currency-symbol-prefixed
+  amounts, DD/MM/YYYY dates) is deliberately left as-is at the source —
+  `loans.py` parses amounts/rates into floats on the way in (tolerant of
+  both US-style `393,507.39` and EU-style `393.507,39` grouping, since a
+  sheet's regional format isn't something to assume), but dates are shown
+  verbatim in the report. All free-text sheet fields (institution, loan
+  type, notes, etc.) are HTML-escaped before rendering — a sheet is
+  external input, not code-controlled text like `CATEGORY_LABELS`.
+- The Predicted card's `mortgage`/`car_finance` rows (see "Forecasting"
+  below) get an extra note per matching loan, e.g.
+  `Loan Tracker (DNB): 12,500 NOK due 01/09/2026` — informational
+  cross-reference only, never used to change `predicted_next` or
+  `method`. If more than one loan shares a type (e.g. two car loans from
+  different institutions), each gets its own note rather than one
+  clobbering the other.
+- **Stale-sheet fallback**: if a loan row's `last_updated` is more than 30
+  days old (or missing) — or `monthly_payment`/`next_payment_date` is
+  simply blank — those two fields fall back to a value derived from actual
+  transaction history: `monthly_payment` from the matching category's own
+  `forecast.py` prediction, `next_payment_date` from the most recent
+  matching transaction's date plus one month. Each field is tagged
+  `(est.)` independently — in both the Loan details card and the
+  Predicted card's cross-reference note — so an estimated value is never
+  confused with an actual sheet-sourced fact, and a row where only one of
+  the two fields was estimated doesn't mislabel the other.
+  `outstanding_balance`, `interest_rate_pct`, `original_amount`, and
+  `maturity_date` are **never** estimated this way — transaction history
+  has no honest way to recover a loan's actual principal, rate, or term,
+  so a stale/blank value there is shown as-is (or `?`), not guessed.
+- Skip this step entirely with `--skip-loans`.
 
 ## Forecasting
 
@@ -141,6 +200,10 @@ Options:
 | `--out-dir PATH` | `~/Documents/MyFinance` | override for testing |
 | `--refresh` | off | ignore every per-month transaction cache file this range touches AND the balance cache, re-fetch everything live |
 | `--skip-balance` | off | skip the live "balance in hand" lookup — useful if you're rate-limited or just want the cached-only report faster |
+| `--skip-loans` | off | skip the Loan Tracker sheet lookup entirely |
+| `--refresh-loans` | off | ignore the 1-day loan sheet cache, re-fetch it live |
+| `--loan-sheet-account` | whatever's already cached | Google account for the Loan Tracker sheet; only needed the first time or if it changes |
+| `--loan-sheet-id` | whatever's already cached | Drive file id for the Loan Tracker sheet; only needed the first time or if it changes |
 
 For a single calendar month, `--from`/`--to` should span the 1st to the
 last day of that month — the report's "focus month" (the KPI row, the
@@ -155,6 +218,8 @@ range, with earlier months providing trend context in the charts.
   still reused): `data/balance_cache.json`
 - Forecast model (persists across runs, one per currency, not per period):
   `data/forecast_model_<currency>.json`
+- Loan Tracker sheet cache (1-day TTL, one entry regardless of currency):
+  `data/loan_tracker_cache.json`
 - Report: `reports/<label>-<institutions>-report.html`
 - `<label>` (report filenames only, not the data cache) is `YYYY-MM` for one
   full calendar month, `YYYY-MM_to_YYYY-MM` for several full calendar
@@ -244,6 +309,16 @@ then check the newest file in `~/Documents/MyFinance/logs/` and
 `launchctl bootout gui/$(id -u)/com.jbgatewaymcp.financereport.monthly`,
 then delete the plist from `~/Library/LaunchAgents/`.
 
+**If you move/reinstall this plugin to a different path**, the installed
+plist does *not* follow it — `ProgramArguments` bakes in the absolute
+`__PLUGIN_ROOT__` path at install time (see the `sed` step above), it
+doesn't re-resolve at runtime. A plugin move without reinstalling the
+plist leaves `launchctl` pointing at a script that no longer exists there
+— the job fails silently (check `last exit code` per "Verify" above) with
+no error surfaced anywhere else. Re-run the **Install** steps above
+(bootout the old one, regenerate the plist from the new `PLUGIN_ROOT`,
+bootstrap it) any time the plugin's install location changes.
+
 **The gotcha that will eat an hour if you hit it blind**: a fresh
 `launchd`-spawned process has **no access to `~/Documents`** by default —
 macOS TCC (privacy protection) blocks it, even though your interactive
@@ -264,3 +339,16 @@ binary that needs the grant — not the script file itself, and not
 the machine gets `~/Documents` access, not just this job) — the
 standard/only practical fix for this scenario on modern macOS, but flag it
 rather than treat it as free.
+
+**Known unresolved gotcha: `notify_email.py` can hang indefinitely under
+launchd.** Triggering the job via `launchctl kickstart` has been observed
+to leave `notify_email.py` running (not exited, not erroring) — most
+likely a one-time macOS Keychain access prompt for the Gmail credential
+that a launchd-spawned process hasn't been granted "Always Allow" for yet,
+which a headless/non-interactive trigger can't answer. `generate_report.py`
+itself completes and writes the report fine either way — only the email
+step is affected. If a run seems stuck, check for a Keychain prompt on
+screen and approve it; `ps aux | grep notify_email` confirms whether it's
+actually hung versus just slow. Not yet fixed as of this writing — treat a
+hung run as a signal to check for that prompt, not as a script bug to
+chase in the code.

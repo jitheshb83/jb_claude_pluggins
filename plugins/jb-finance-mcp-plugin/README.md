@@ -15,6 +15,10 @@ locally — see below.
 - **`skills/finance-report`** — generate a local HTML spending/income
   report with a next-month forecast, cached under `~/Documents/MyFinance/`;
   optional monthly `launchd` automation with an email status notification.
+  Also includes a "Loan details" section (balance, rate, next payment) from
+  a manually-maintained Google Sheet — Enable Banking doesn't expose loan/
+  mortgage accounts, so this data isn't pulled from the bank tools; see
+  "Loan details" in `skills/finance-report/SKILL.md`.
 - **`agents/finance-analyst`** — a subagent scoped to spending analysis,
   balance checks, and forecasts using the `bank.*` tools.
 - **`.mcp.json`** — declares the `jb-gateway-mcp` server (see prerequisite

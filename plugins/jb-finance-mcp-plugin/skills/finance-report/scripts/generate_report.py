@@ -22,6 +22,13 @@ Options:
     --refresh                    ignore existing per-month cache files
                                  covering this range and re-fetch all of
                                  them live
+    --skip-loans                 skip the Loan Tracker sheet lookup
+    --refresh-loans               ignore the 1-day loan sheet cache and
+                                 re-fetch it live
+    --loan-sheet-account          Google account for the Loan Tracker sheet
+                                 (default: whatever's already cached)
+    --loan-sheet-id                Drive file id for the Loan Tracker sheet
+                                 (default: whatever's already cached)
 
 See SKILL.md in this directory for the full write-up (categorization rules,
 cache-reuse policy, known gotchas).
@@ -31,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import html
 import json
 import sys
 from collections import defaultdict
@@ -43,6 +51,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).parent))
 from categories import categorize, dedupe_transactions  # noqa: E402
 from forecast import predicted_expense_total, update_and_predict  # noqa: E402
+from loans import fetch_loan_details  # noqa: E402
 
 from jb_gateway_mcp.adapters import enable_banking
 from jb_gateway_mcp.cli.onboard_bank import _INSTITUTION_COUNTRY
@@ -73,6 +82,21 @@ CATEGORY_LABELS = {
     "dividend": "Dividend",
     "income_other": "Other income",
 }
+
+# Maps a forecast/expense category to the Loan Tracker sheet's `loan_type`
+# value, so the Predicted card can cross-reference a category's rule-based
+# prediction against the sheet's stated next payment — informational only,
+# never used to override predicted_next itself.
+LOAN_TYPE_BY_CATEGORY = {"mortgage": "mortgage", "car_finance": "car"}
+CATEGORY_BY_LOAN_TYPE = {v: k for k, v in LOAN_TYPE_BY_CATEGORY.items()}
+
+# A loan row whose last_updated is older than this (or missing) is treated
+# as stale: monthly_payment/next_payment_date fall back to a value derived
+# from actual transaction history instead of trusting an out-of-date sheet
+# entry. Fields with no honest transaction-derived equivalent
+# (outstanding_balance, interest_rate_pct, original_amount, maturity_date)
+# are never guessed — they're left as whatever the sheet says, stale or not.
+_LOAN_STALE_DAYS = 30
 
 # Preference order for which balance line to report as "balance in hand" —
 # Enable Banking returns several types per account; these usually agree
@@ -224,6 +248,62 @@ def next_month_key(month: str) -> str:
     if mon > 12:
         mon, year = 1, year + 1
     return f"{year:04d}-{mon:02d}"
+
+
+def _parse_ddmmyyyy(raw: str | None) -> date | None:
+    if not raw or not raw.strip():
+        return None
+    try:
+        return datetime.strptime(raw.strip(), "%d/%m/%Y").date()
+    except ValueError:
+        return None
+
+
+def _add_one_month(d: date) -> date:
+    year, month = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, min(d.day, last_day))
+
+
+def _last_transaction_date(dataset: dict[str, Any], category: str) -> date | None:
+    found = [
+        date.fromisoformat(txn["date"])
+        for txns in dataset["transactions"].values()
+        for txn in txns
+        if txn["category"] == category
+    ]
+    return max(found) if found else None
+
+
+def _enrich_stale_loan_row(
+    row: dict[str, Any],
+    dataset: dict[str, Any],
+    forecast_model: dict[str, Any] | None,
+    today: date,
+) -> dict[str, Any]:
+    """Fall back to transaction-derived values for monthly_payment/
+    next_payment_date when the sheet row is stale or those fields are
+    blank. Never touches outstanding_balance/interest_rate_pct/
+    original_amount/maturity_date — those have no honest transaction-derived
+    equivalent, so a stale/blank value there is left as-is, not guessed."""
+    row = dict(row)
+    last_updated = _parse_ddmmyyyy(row.get("last_updated"))
+    stale = last_updated is None or (today - last_updated).days > _LOAN_STALE_DAYS
+    category = CATEGORY_BY_LOAN_TYPE.get((row.get("loan_type") or "").strip().lower())
+
+    if (stale or row.get("monthly_payment") is None) and forecast_model and category:
+        entry = forecast_model.get("categories", {}).get(category)
+        if entry is not None:
+            row["monthly_payment"] = entry["predicted_next"]
+            row["monthly_payment_estimated"] = True
+
+    if (stale or not row.get("next_payment_date")) and category:
+        last_txn_date = _last_transaction_date(dataset, category)
+        if last_txn_date is not None:
+            row["next_payment_date"] = _add_one_month(last_txn_date).strftime("%d/%m/%Y")
+            row["next_payment_date_estimated"] = True
+
+    return row
 
 
 def build_dataset(
@@ -536,6 +616,7 @@ def render_html(
     balance_total: float | None = None,
     balance_warnings: list[str] | None = None,
     forecast_model: dict[str, Any] | None = None,
+    loan_rows: list[dict[str, Any]] | None = None,
 ) -> str:
     months = sorted(monthly.get(currency, {}))
     if not months:
@@ -544,6 +625,14 @@ def render_html(
     focus_data = monthly[currency][focus]
     prev_data = monthly[currency][months[-2]] if len(months) > 1 else None
     balance_warnings = balance_warnings or []
+    today = date.fromisoformat(dataset["generated_at"])
+    loan_rows = [
+        _enrich_stale_loan_row(row, dataset, forecast_model, today) for row in (loan_rows or [])
+    ]
+    loan_by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in loan_rows:
+        if row.get("loan_type"):
+            loan_by_type[row["loan_type"].strip().lower()].append(row)
 
     max_flow = max(max(m["income"], m["true_expense"]) for m in monthly[currency].values()) or 1
     gbar_groups = []
@@ -716,6 +805,20 @@ def render_html(
                 continue
             label = CATEGORY_LABELS.get(cat, cat)
             note = method_notes.get(entry["method"], entry["method"])
+            loan_type = LOAN_TYPE_BY_CATEGORY.get(cat)
+            for loan_row in (loan_by_type.get(loan_type, []) if loan_type else []):
+                loan_payment = loan_row.get("monthly_payment")
+                if loan_payment is None:
+                    continue
+                payment_tag = " (est.)" if loan_row.get("monthly_payment_estimated") else ""
+                due_tag = " (est.)" if loan_row.get("next_payment_date_estimated") else ""
+                loan_currency = html.escape(str(loan_row.get("currency") or currency))
+                loan_due = html.escape(str(loan_row.get("next_payment_date") or "?")) + due_tag
+                loan_institution = html.escape(str(loan_row.get("institution") or "?")).upper()
+                note += (
+                    f" — Loan Tracker ({loan_institution}): {loan_payment:,.0f}{payment_tag}"
+                    f" {loan_currency} due {loan_due}"
+                )
             cat_rows.append(
                 f"<tr><td>{label}</td><td class='num'>{entry['predicted_next']:,.0f}"
                 f" {currency}</td><td>{note}</td></tr>"
@@ -749,6 +852,60 @@ def render_html(
     <table>
       <tr><th>Category</th><th class="num">Predicted</th><th>Basis</th></tr>
       {''.join(cat_rows)}
+    </table>
+  </div>"""
+
+    loan_html = ""
+    if loan_rows:
+        loan_row_html = []
+        for row in loan_rows:
+            row_currency = html.escape(str(row.get("currency") or currency))
+            balance = row.get("outstanding_balance")
+            balance_str = f"{balance:,.0f} {row_currency}" if balance is not None else "?"
+            payment = row.get("monthly_payment")
+            payment_str = f"{payment:,.0f} {row_currency}" if payment is not None else "?"
+            if row.get("monthly_payment_estimated"):
+                payment_str += " (est.)"
+            rate = row.get("interest_rate_pct")
+            rate_str = f"{rate:.2f}%" if rate is not None else "?"
+            interest_type = html.escape(str(row.get("interest_type") or "?"))
+            next_payment_str = html.escape(str(row.get("next_payment_date") or "?"))
+            if row.get("next_payment_date_estimated"):
+                next_payment_str += " (est.)"
+            institution = html.escape(str(row.get("institution") or "?")).upper()
+            loan_type = html.escape(str(row.get("loan_type") or "?"))
+            maturity_date = html.escape(str(row.get("maturity_date") or "?"))
+            notes = html.escape(str(row.get("notes") or ""))
+            loan_row_html.append(
+                "<tr>"
+                f"<td>{institution}</td>"
+                f"<td>{loan_type}</td>"
+                f"<td class='num'>{balance_str}</td>"
+                f"<td>{rate_str} ({interest_type})</td>"
+                f"<td class='num'>{payment_str}</td>"
+                f"<td>{next_payment_str}</td>"
+                f"<td>{maturity_date}</td>"
+                f"<td>{notes}</td>"
+                "</tr>"
+            )
+        loan_html = f"""
+  <div class="card">
+    <h2>Loan details</h2>
+    <p class="sub">
+      From the manually-maintained Loan Tracker sheet — not part of the
+      transaction-based figures above. "(est.)" means the sheet was stale
+      or missing that field, so it's estimated from actual transaction
+      history instead (outstanding balance/rate/maturity are never
+      estimated this way — no honest transaction-derived equivalent
+      exists for those).
+    </p>
+    <table>
+      <tr>
+        <th>Institution</th><th>Type</th><th class="num">Outstanding</th>
+        <th>Rate</th><th class="num">Next payment</th><th>Due</th>
+        <th>Maturity</th><th>Notes</th>
+      </tr>
+      {''.join(loan_row_html)}
     </table>
   </div>"""
 
@@ -833,6 +990,7 @@ def render_html(
     <table><tr><th>Category</th>{table_header}</tr>{''.join(table_rows)}</table>
   </div>
 {forecast_html}
+{loan_html}
 
   <div class="card">
     <h2>Signals</h2>
@@ -887,6 +1045,24 @@ def main(argv: list[str] | None = None) -> int:
         "--skip-balance",
         action="store_true",
         help="skip the live 'balance in hand' lookup (e.g. to avoid an extra API call)",
+    )
+    parser.add_argument(
+        "--skip-loans", action="store_true", help="skip the Loan Tracker sheet lookup"
+    )
+    parser.add_argument(
+        "--refresh-loans",
+        action="store_true",
+        help="ignore the 1-day loan sheet cache and re-fetch it live",
+    )
+    parser.add_argument(
+        "--loan-sheet-account",
+        default=None,
+        help="Google account for the Loan Tracker sheet (default: whatever's already cached)",
+    )
+    parser.add_argument(
+        "--loan-sheet-id",
+        default=None,
+        help="Drive file id for the Loan Tracker sheet (default: whatever's already cached)",
     )
     args = parser.parse_args(argv)
 
@@ -974,6 +1150,12 @@ def main(argv: list[str] | None = None) -> int:
         for warning in balance_warnings:
             print(f"  [balance warning] {warning}", file=sys.stderr)
 
+    loan_rows: list[dict[str, Any]] = []
+    if not args.skip_loans:
+        loan_rows = fetch_loan_details(
+            out_dir, args.loan_sheet_account, args.loan_sheet_id, refresh=args.refresh_loans
+        )
+
     institutions_slug = "-".join(dataset["institutions"])
     report_path = reports_dir / f"{label}-{institutions_slug}-report.html"
     report_path.write_text(
@@ -985,6 +1167,7 @@ def main(argv: list[str] | None = None) -> int:
             balance_total=balance_total,
             balance_warnings=balance_warnings,
             forecast_model=forecast_model,
+            loan_rows=loan_rows,
         )
     )
     print(f"Wrote report: {report_path}")
