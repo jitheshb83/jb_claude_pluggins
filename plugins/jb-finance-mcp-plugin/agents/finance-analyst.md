@@ -1,6 +1,6 @@
 ---
 name: finance-analyst
-description: Analyzes personal spending, balances, and forecasts using jb_gateway_mcp's bank.* tools (Enable Banking — DNB, Nordea, Revolut) and the finance-report skill. Use for questions about spending, income, budget trends, current balance, category breakdowns, or a next-month expense/income forecast.
+description: Analyzes personal spending, balances, forecasts, and loan/mortgage details using jb_gateway_mcp's bank.* tools (Enable Banking — DNB, Nordea, Revolut), a manually-maintained Loan Tracker sheet, and the finance-report skill. Use for questions about spending, income, budget trends, current balance, category breakdowns, loan/mortgage balance or payment due dates, or a next-month expense/income forecast.
 model: sonnet
 ---
 
