@@ -220,7 +220,10 @@ range, with earlier months providing trend context in the charts.
   `data/forecast_model_<currency>.json`
 - Loan Tracker sheet cache (1-day TTL, one entry regardless of currency):
   `data/loan_tracker_cache.json`
-- Report: `reports/<label>-<institutions>-report.html`
+- Report: `reports/<label>-<institutions>-<currency>-report.html` — currency
+  is part of the filename so that running the same institutions+range for
+  two different `--currency` values (e.g. NOK then EUR) writes two separate
+  files instead of the second silently overwriting the first.
 - `<label>` (report filenames only, not the data cache) is `YYYY-MM` for one
   full calendar month, `YYYY-MM_to_YYYY-MM` for several full calendar
   months, or the literal ISO dates if the range isn't month-aligned.

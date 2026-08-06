@@ -1157,7 +1157,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     institutions_slug = "-".join(dataset["institutions"])
-    report_path = reports_dir / f"{label}-{institutions_slug}-report.html"
+    report_path = reports_dir / f"{label}-{institutions_slug}-{args.currency}-report.html"
     report_path.write_text(
         render_html(
             dataset,
