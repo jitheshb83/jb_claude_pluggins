@@ -49,7 +49,18 @@ from typing import Any
 import httpx
 
 sys.path.insert(0, str(Path(__file__).parent))
-from categories import categorize, dedupe_transactions  # noqa: E402
+from cards import (  # noqa: E402
+    load_person_recipients,
+    load_statements,
+    statement_pdfs_present,
+    write_analysis,
+)
+from categories import (  # noqa: E402
+    CARD_CATEGORY_LABELS,
+    categorize,
+    categorize_card,
+    dedupe_transactions,
+)
 from forecast import predicted_expense_total, update_and_predict  # noqa: E402
 from loans import fetch_loan_details  # noqa: E402
 
@@ -81,7 +92,17 @@ CATEGORY_LABELS = {
     "pension_benefit": "Pension/benefit",
     "dividend": "Dividend",
     "income_other": "Other income",
+    "credit_card_settlement": "Credit card settlement",
 }
+CATEGORY_LABELS.update(CARD_CATEGORY_LABELS)
+
+# The card's own purchases are the real spend; the monthly lump bill payment
+# to Entercard is only the settlement of that debt. Counting both would
+# double-count the same money, so once a statement has been decomposed the
+# lump is reclassified here and excluded from income/expense exactly the way
+# a transfer between the user's own accounts already is.
+CARD_SETTLEMENT_CATEGORY = "credit_card_settlement"
+NON_SPEND_CATEGORIES = {"internal_transfer", CARD_SETTLEMENT_CATEGORY}
 
 # Maps a forecast/expense category to the Loan Tracker sheet's `loan_type`
 # value, so the Predicted card can cross-reference a category's rule-based
@@ -265,12 +286,40 @@ def _add_one_month(d: date) -> date:
     return date(year, month, min(d.day, last_day))
 
 
+def _txn_sort_key(txn: dict[str, Any]) -> str:
+    """Sort key tolerant of a missing booking date. Some DNB entries arrive
+    with `date: null` (seen on a pending Pensjon/Trygd credit); a bare
+    `txn["date"]` comparison raises TypeError as soon as one shares a list
+    with a dated entry."""
+    return txn.get("date") or ""
+
+
+def _with_fallback_dates(
+    txns: list[dict[str, Any]], window_from: str
+) -> list[dict[str, Any]]:
+    """Anchor any dateless transaction to its fetch window's start date.
+
+    Each part passed to `_merge_datasets` spans a single calendar month, so
+    the window's own start is guaranteed to be the right *month* for such an
+    entry even though its day is unknown — which is what the month bucketing
+    in `monthly_summaries_by_currency` needs. Falling back to the merged
+    range's start instead would push an August entry into July. The entry is
+    tagged `date_missing` so anything that needs a real observed date (see
+    `_last_transaction_date`) can skip it rather than trust the 1st."""
+    filled: list[dict[str, Any]] = []
+    for txn in txns:
+        if txn.get("date") is None:
+            txn = {**txn, "date": window_from, "date_missing": True}
+        filled.append(txn)
+    return filled
+
+
 def _last_transaction_date(dataset: dict[str, Any], category: str) -> date | None:
     found = [
         date.fromisoformat(txn["date"])
         for txns in dataset["transactions"].values()
         for txn in txns
-        if txn["category"] == category
+        if txn["category"] == category and not txn.get("date_missing")
     ]
     return max(found) if found else None
 
@@ -346,7 +395,7 @@ def build_dataset(
                         "category": category,
                     }
                 )
-        transactions_by_institution[institution] = sorted(txns, key=lambda t: t["date"])
+        transactions_by_institution[institution] = sorted(txns, key=_txn_sort_key)
 
     return {
         "generated_at": datetime.now(UTC).date().isoformat(),
@@ -386,9 +435,11 @@ def _merge_datasets(
                 institutions.append(institution)
         accounts.update(part["accounts"])
         for institution, txns in part["transactions"].items():
-            transactions[institution].extend(txns)
+            transactions[institution].extend(
+                _with_fallback_dates(txns, part["period"]["from"])
+            )
     for institution in transactions:
-        transactions[institution].sort(key=lambda t: t["date"])
+        transactions[institution].sort(key=_txn_sort_key)
 
     return {
         "generated_at": datetime.now(UTC).date().isoformat(),
@@ -397,6 +448,164 @@ def _merge_datasets(
         "institutions": institutions,
         "accounts": accounts,
         "transactions": dict(transactions),
+    }
+
+
+def _months_in_range(date_from: str, date_to: str) -> list[str]:
+    start, end = date.fromisoformat(date_from), date.fromisoformat(date_to)
+    months, cursor = [], start.replace(day=1)
+    while cursor <= end:
+        months.append(cursor.strftime("%Y-%m"))
+        cursor = _add_one_month(cursor.replace(day=1))
+    return months
+
+
+def apply_card_decomposition(
+    dataset: dict[str, Any],
+    statements: list[dict[str, Any]],
+    date_from: str,
+    date_to: str,
+    currency: str,
+    person_recipients: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
+    """Replace the bank's lump credit-card bill payments with the card's own
+    itemized purchases, attributed by purchase date (`Bruksdato`).
+
+    Two deliberate choices, both documented in data/cards/README.md:
+
+    * **Decompose, don't add.** The lump is reclassified to
+      CARD_SETTLEMENT_CATEGORY (non-spend) rather than deleted, so the cash
+      movement stays auditable in the data while the purchases it settles
+      are what actually counts as expense. Adding both would double-count.
+    * **Purchase date, not bill date.** A 20 Aug purchase is August spend
+      even though the bill cleared 15 Sep. A month's card spend therefore
+      will *not* equal that month's bill payment; the returned
+      reconciliation rows exist to make that difference explicit rather
+      than surprising.
+
+    Returns None when there is nothing to decompose for this currency."""
+    statements = [st for st in statements if st["currency"] == currency]
+    if not statements:
+        return None
+
+    card_txns: list[dict[str, Any]] = []
+    for statement in statements:
+        for line in statement["transactions"]:
+            if line["section"] != "purchases":
+                continue
+            if not date_from <= line["purchase_date"] <= date_to:
+                continue  # attributed to a month outside this report
+            txn = {
+                "account_uid": f"card-{line['card_last4']}",
+                "account_name": line["cardholder"],
+                "currency": statement["currency"],
+                "date": line["purchase_date"],
+                "amount": line["amount"],
+                "direction": line["direction"],
+                "counterparty_name": line["description"],
+                "description": " ".join(
+                    part for part in (line["description"], line["place"]) if part
+                ),
+                "category": categorize_card(
+                    line["description"], line["place"], person_recipients
+                ),
+                "booking_date": line["booking_date"],
+                "source_statement": statement["source_pdf"],
+            }
+            if line.get("fx"):
+                txn["fx"] = line["fx"]
+            card_txns.append(txn)
+
+    covered_months: set[str] = set()
+    for statement in statements:
+        period = statement["statement_period"]
+        covered_months.update(_months_in_range(period["from"], period["to"]))
+
+    # Reclassify in-range lump bill payments, and match each to the statement
+    # it settles by total_due so the report can show the chain rather than
+    # asserting it.
+    #
+    # A lump is only dropped when its own month has itemized purchases to
+    # replace it. Without that gate the automated monthly run silently
+    # understated expenses by an entire card bill: on the 1st of the month
+    # the statement covering the month just ended often is not in
+    # data/cards/ yet, so the lump was reclassified as non-spend and nothing
+    # took its place. Keeping the lump degrades back to the pre-decomposition
+    # figure, which is right in aggregate, instead of losing the money.
+    settlements: list[dict[str, Any]] = []
+    kept_lumps: list[dict[str, Any]] = []
+    for rows in dataset["transactions"].values():
+        for row in rows:
+            if row["category"] != "credit_card" or row["currency"] != currency:
+                continue
+            if month_key(row["date"]) not in covered_months:
+                kept_lumps.append({"paid_on": row["date"], "amount": row["amount"]})
+                continue
+            row["category"] = CARD_SETTLEMENT_CATEGORY
+            matched = next(
+                (
+                    st
+                    for st in statements
+                    if abs(st["totals"].get("total_due", -1) - row["amount"]) <= 0.02
+                ),
+                None,
+            )
+            if matched is not None:
+                row["settles_statement"] = matched["source_pdf"]
+            settlements.append(
+                {
+                    "paid_on": row["date"],
+                    "amount": row["amount"],
+                    "statement": None if matched is None else matched["source_pdf"],
+                    "statement_period": None
+                    if matched is None
+                    else matched["statement_period"],
+                }
+            )
+
+    range_months = _months_in_range(date_from, date_to)
+    uncovered = [m for m in range_months if m not in covered_months]
+
+    # A purchase late in month M is often booked in M+1 and therefore prints
+    # on the *next* statement. The most recent covered month is only
+    # complete once that following statement exists, so flag it instead of
+    # presenting a possibly-short figure as final.
+    latest_period_end = max(st["statement_period"]["to"] for st in statements)
+    spillover_pending = [
+        m for m in range_months if m == month_key(latest_period_end) and m not in uncovered
+    ]
+
+    spend_by_month: dict[str, float] = defaultdict(float)
+    for txn in card_txns:
+        if txn["direction"] == "DBIT" and txn["category"] not in NON_SPEND_CATEGORIES:
+            spend_by_month[month_key(txn["date"])] += txn["amount"]
+
+    card_name = statements[0]["card"]
+    if card_txns:
+        dataset["transactions"][card_name] = sorted(card_txns, key=_txn_sort_key)
+        if card_name not in dataset["institutions"]:
+            dataset["institutions"].append(card_name)
+
+    return {
+        "card": card_name,
+        "issuer": statements[0]["issuer"],
+        "statements": [
+            {
+                "source_pdf": st["source_pdf"],
+                "period": st["statement_period"],
+                "due_date": st["due_date"],
+                "total_due": st["totals"].get("total_due"),
+                "fees_in_period": st["totals"].get("fees_in_period"),
+                "cardholders": st["cardholders"],
+            }
+            for st in statements
+        ],
+        "settlements": sorted(settlements, key=lambda s: s["paid_on"]),
+        "purchase_count": len(card_txns),
+        "spend_by_month": {m: round(v, 2) for m, v in sorted(spend_by_month.items())},
+        "uncovered_months": uncovered,
+        "spillover_pending_months": spillover_pending,
+        "kept_lumps": sorted(kept_lumps, key=lambda item: item["paid_on"]),
     }
 
 
@@ -416,8 +625,8 @@ def monthly_summaries_by_currency(dataset: dict[str, Any]) -> dict[str, dict[str
     for txns in dataset["transactions"].values():
         for txn in txns:
             bucket = by_currency[txn["currency"]][month_key(txn["date"])]
-            if txn["category"] == "internal_transfer":
-                continue  # a move between own accounts, never income or spend
+            if txn["category"] in NON_SPEND_CATEGORIES:
+                continue  # a move between own accounts / a card bill settlement
             if txn["direction"] == "CRDT":
                 bucket["income"] += txn["amount"]
                 bucket["income_breakdown"][txn["category"]] += txn["amount"]
@@ -521,6 +730,7 @@ header.report-head p { margin:0; color:var(--text-secondary); font-size:14px; }
   border-radius:12px; padding:20px 22px; margin-bottom:20px;
 }
 .card h2 { font-size:15px; margin:0 0 4px; }
+.card h3 { font-size:13px; margin:14px 0 4px; color:var(--text-muted); font-weight:600; }
 .card .sub { color:var(--text-secondary); font-size:12.5px; margin:0 0 18px; }
 .kpi-row {
   display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr));
@@ -617,6 +827,7 @@ def render_html(
     balance_warnings: list[str] | None = None,
     forecast_model: dict[str, Any] | None = None,
     loan_rows: list[dict[str, Any]] | None = None,
+    card_info: dict[str, Any] | None = None,
 ) -> str:
     months = sorted(monthly.get(currency, {}))
     if not months:
@@ -855,6 +1066,124 @@ def render_html(
     </table>
   </div>"""
 
+    card_footnote = ""
+    card_html = ""
+    if card_info:
+        card_footnote = (
+            "The monthly credit-card bill payment is likewise excluded "
+            "(category: credit_card_settlement) — the card's own itemized "
+            "purchases are counted instead, on the date they were made."
+        )
+        statement_rows = []
+        for st in card_info["statements"]:
+            holders = ", ".join(
+                f"{html.escape(c['name'].title())} &middot;&middot;&middot;{c['card_last4']}"
+                f" ({c.get('used_credit_parsed', 0):,.0f})"
+                for c in st["cardholders"]
+            )
+            statement_rows.append(
+                "<tr>"
+                f"<td>{html.escape(st['period']['from'])} &rarr; {html.escape(st['period']['to'])}</td>"
+                f"<td class='num'>{(st['total_due'] or 0):,.0f} {currency}</td>"
+                f"<td>{html.escape(str(st['due_date']))}</td>"
+                f"<td class='num'>{(st['fees_in_period'] or 0):,.0f}</td>"
+                f"<td>{holders}</td>"
+                "</tr>"
+            )
+
+        settle_rows = []
+        for item in card_info["settlements"]:
+            if item["statement"] is None:
+                matched = "<span class='warn'>no statement in data/cards/ matches this amount</span>"
+            else:
+                period = item["statement_period"]
+                matched = (
+                    f"settles {html.escape(period['from'])} &rarr; "
+                    f"{html.escape(period['to'])} &check;"
+                )
+            settle_rows.append(
+                "<tr>"
+                f"<td>{html.escape(item['paid_on'])}</td>"
+                f"<td class='num'>{item['amount']:,.2f} {currency}</td>"
+                f"<td>{matched}</td>"
+                "</tr>"
+            )
+
+        spend_rows = "".join(
+            "<tr>"
+            f"<td>{html.escape(month)}</td>"
+            f"<td class='num'>{amount:,.0f} {currency}</td>"
+            "</tr>"
+            for month, amount in card_info["spend_by_month"].items()
+        )
+
+        notes = []
+        for month in card_info["uncovered_months"]:
+            notes.append(
+                f"<p class='warn'>No statement covers {html.escape(month)}, so "
+                "its card bill is still counted as one lump "
+                "&ldquo;Credit card&rdquo; expense rather than itemized "
+                "categories. The month's total is right; only its breakdown is "
+                "coarse. Drop that month's statement PDF into "
+                f"<code>data/cards/{html.escape(card_info['card'])}/</code> and "
+                "re-run to break it out.</p>"
+            )
+        if card_info["kept_lumps"]:
+            kept = ", ".join(
+                f"{item['amount']:,.0f} on {html.escape(item['paid_on'])}"
+                for item in card_info["kept_lumps"]
+            )
+            notes.append(
+                f"<p class='sub'>Left as lump payments (no itemized statement "
+                f"for their month): {kept}.</p>"
+            )
+        for month in card_info["spillover_pending_months"]:
+            notes.append(
+                f"<p class='sub'>{html.escape(month)} is the most recent covered "
+                "month. A purchase made late in it is often booked in the "
+                "following month and prints on the <em>next</em> statement, which "
+                "isn't in <code>data/cards/</code> yet — so this month's card "
+                "spend may still rise slightly.</p>"
+            )
+
+        card_html = f"""
+  <div class="card">
+    <h2>Credit card &mdash; {html.escape(card_info['issuer'])}</h2>
+    <p class="sub">
+      {card_info['purchase_count']} itemized purchases parsed from
+      {len(card_info['statements'])} statement PDF(s) in
+      <code>data/cards/remember/</code>. These purchases <em>are</em> the
+      expense figures in the breakdown above, broken out by real category.
+      The monthly lump bill payment to the issuer is reclassified as
+      &ldquo;Credit card settlement&rdquo; and excluded from spend &mdash;
+      counting both would double-count the same money. Every statement's
+      parsed total is checked against its own printed subtotals before use.
+    </p>
+    <table>
+      <tr>
+        <th>Statement period</th><th class="num">Total due</th><th>Due date</th>
+        <th class="num">Fees</th><th>Cardholders (used credit)</th>
+      </tr>
+      {''.join(statement_rows)}
+    </table>
+    <h3>Bill payments seen on the bank side</h3>
+    <table>
+      <tr><th>Paid on</th><th class="num">Amount</th><th>Reconciliation</th></tr>
+      {''.join(settle_rows)}
+    </table>
+    <h3>Card spend by purchase month</h3>
+    <p class="sub">
+      Attributed by <code>Bruksdato</code> (purchase date), not by when the
+      bill was paid &mdash; so these will not equal the bill payments above,
+      which lag by about a month.
+    </p>
+    <table>
+      <tr><th>Month</th><th class="num">Card spend</th></tr>
+      {spend_rows}
+    </table>
+    {''.join(notes)}
+  </div>"""
+
     loan_html = ""
     if loan_rows:
         loan_row_html = []
@@ -949,6 +1278,7 @@ def render_html(
   <p style="font-size:11.5px;color:var(--text-muted);margin:-6px 0 20px;">
     "True" figures exclude transfers between your own accounts
     (category: internal_transfer) — those are moves, not income or spend.
+    {card_footnote}
   </p>{balance_note}
 
   <div class="card">
@@ -990,6 +1320,7 @@ def render_html(
     <table><tr><th>Category</th>{table_header}</tr>{''.join(table_rows)}</table>
   </div>
 {forecast_html}
+{card_html}
 {loan_html}
 
   <div class="card">
@@ -1064,6 +1395,17 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Drive file id for the Loan Tracker sheet (default: whatever's already cached)",
     )
+    parser.add_argument(
+        "--skip-cards",
+        action="store_true",
+        help="ignore data/cards/ statement PDFs; leave the credit-card bill "
+        "as one lump expense instead of decomposing it",
+    )
+    parser.add_argument(
+        "--refresh-cards",
+        action="store_true",
+        help="re-parse every statement PDF even if its parsed JSON is current",
+    )
     args = parser.parse_args(argv)
 
     out_dir = Path(args.out_dir).expanduser()
@@ -1128,6 +1470,50 @@ def main(argv: list[str] | None = None) -> int:
 
     dataset = _merge_datasets(parts, args.date_from, args.date_to)
 
+    # Credit-card statements are local PDFs, not an API: parsing them costs
+    # nothing and never touches the bank quota, so this runs before the
+    # summaries so the decomposed categories feed everything downstream
+    # (breakdown, signals, forecast) rather than being bolted on at render.
+    card_info: dict[str, Any] | None = None
+    cards_dir = data_dir / "cards"
+    if not args.skip_cards and statement_pdfs_present(cards_dir):
+        statements = load_statements(cards_dir, refresh=args.refresh_cards)
+        # Always emit the JSON artifacts, independent of the HTML: the
+        # per-statement parsed form plus the compact analysis rollup. They
+        # are what later questions should be answered from instead of
+        # re-reading the PDFs.
+        for analysis_path in write_analysis(cards_dir, statements):
+            print(f"Wrote card JSON: {analysis_path}")
+        card_info = apply_card_decomposition(
+            dataset,
+            statements,
+            args.date_from,
+            args.date_to,
+            args.currency,
+            load_person_recipients(cards_dir),
+        )
+        if card_info:
+            print(
+                f"Decomposed {card_info['card']} card: "
+                f"{card_info['purchase_count']} purchases from "
+                f"{len(card_info['statements'])} statement(s)"
+            )
+            for month in card_info["uncovered_months"]:
+                print(
+                    f"  [card warning] no statement covers {month} — its card "
+                    "bill is left as a single lump expense (not itemized); "
+                    "drop that month's statement PDF in and re-run for a real "
+                    "category breakdown",
+                    file=sys.stderr,
+                )
+            for month in card_info["spillover_pending_months"]:
+                print(
+                    f"  [card note] {month} is the latest covered month; "
+                    "purchases made late in it may be booked onto the next "
+                    "statement, which isn't in data/cards/ yet",
+                    file=sys.stderr,
+                )
+
     monthly = monthly_summaries_by_currency(dataset)
     if args.currency not in monthly:
         available = ", ".join(sorted(monthly)) or "none"
@@ -1156,6 +1542,63 @@ def main(argv: list[str] | None = None) -> int:
             out_dir, args.loan_sheet_account, args.loan_sheet_id, refresh=args.refresh_loans
         )
 
+    # Final, post-decomposition figures as JSON. notify_email.py reads this
+    # rather than re-deriving from the raw month cache: that cache is written
+    # before card decomposition, so deriving from it made the monthly email
+    # contradict the very report it announces (it reported the lump card bill
+    # as expense while the report itself reported itemized purchases). One
+    # computed artifact, one set of numbers. Also the cheap thing to read for
+    # later analysis of a period already reported on.
+    summary_path = data_dir / f"{label}-summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "generated_at": dataset["generated_at"],
+                "label": label,
+                "period": {"from": args.date_from, "to": args.date_to},
+                "currency": args.currency,
+                "institutions": dataset["institutions"],
+                "focus_month": sorted(monthly[args.currency])[-1],
+                "monthly": {
+                    month: {
+                        "income": round(figures["income"], 2),
+                        "true_expense": round(figures["true_expense"], 2),
+                        "net": round(figures["net"], 2),
+                        "category_breakdown": {
+                            k: round(v, 2)
+                            for k, v in sorted(
+                                figures["category_breakdown"].items(), key=lambda kv: -kv[1]
+                            )
+                        },
+                        "income_breakdown": {
+                            k: round(v, 2)
+                            for k, v in sorted(
+                                figures["income_breakdown"].items(), key=lambda kv: -kv[1]
+                            )
+                        },
+                    }
+                    for month, figures in sorted(monthly[args.currency].items())
+                },
+                "signals": signals,
+                "balance_in_hand": balance_total,
+                "balance_warnings": balance_warnings,
+                "card": None
+                if not card_info
+                else {
+                    "card": card_info["card"],
+                    "purchase_count": card_info["purchase_count"],
+                    "spend_by_month": card_info["spend_by_month"],
+                    "uncovered_months": card_info["uncovered_months"],
+                    "spillover_pending_months": card_info["spillover_pending_months"],
+                    "kept_lumps": card_info["kept_lumps"],
+                },
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    print(f"Wrote summary: {summary_path}")
+
     institutions_slug = "-".join(dataset["institutions"])
     report_path = reports_dir / f"{label}-{institutions_slug}-{args.currency}-report.html"
     report_path.write_text(
@@ -1168,6 +1611,7 @@ def main(argv: list[str] | None = None) -> int:
             balance_warnings=balance_warnings,
             forecast_model=forecast_model,
             loan_rows=loan_rows,
+            card_info=card_info,
         )
     )
     print(f"Wrote report: {report_path}")

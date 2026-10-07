@@ -1,6 +1,6 @@
 ---
 name: finance-report
-description: Generates a local HTML financial report (income/expense trend, income splits, category breakdown, month-over-month signals, live balance-in-hand, and a next-month expense/income forecast) from linked bank accounts (DNB, Nordea, Revolut via jb_gateway_mcp), and caches the underlying data + a persisted forecast model under ~/Documents/MyFinance/ for reuse without re-hitting the bank API. Can run unattended via a scheduled launchd job (see launchd/) that auto-generates the report for the prior month on the 1st of each month and emails a success/failure status notification via Gmail. Use when asked for a spending/usage report, financial statistics, expense or income breakdown, budget trends, current balance, a prediction of next month's expenses, or to set up/check/troubleshoot the monthly automated report.
+description: Generates a local HTML financial report (income/expense trend, income splits, category breakdown, month-over-month signals, live balance-in-hand, and a next-month expense/income forecast) from linked bank accounts (DNB, Nordea, Revolut via jb_gateway_mcp) plus manually-imported credit-card statement PDFs (re:member/Entercard), and caches the underlying data + a persisted forecast model under ~/Documents/MyFinance/ for reuse without re-hitting the bank API. Can run unattended via a scheduled launchd job (see launchd/) that auto-generates the report for the prior month on the 1st of each month and emails a success/failure status notification via Gmail. Use when asked for a spending/usage report, financial statistics, expense or income breakdown, budget trends, current balance, a prediction of next month's expenses, to import or analyze a credit-card statement, or to set up/check/troubleshoot the monthly automated report.
 ---
 
 # Generating a personal finance report
@@ -86,6 +86,132 @@ against live data.
    informational: it never changes the forecast model or the Predicted
    card's numbers, only adds a cross-reference note next to a matching
    category's prediction.
+
+10. **Decomposes the credit card** from statement PDFs under
+    `data/cards/` (`scripts/cards.py`) — see "Credit-card statements"
+    below. Unlike the Loan details card, this one *does* change the
+    headline numbers: it replaces the lump bill payment with the card's
+    real spending categories.
+
+## Credit-card statements (no API)
+
+Enable Banking exposes only *payment* accounts, so a credit card's itemized
+purchases are unreachable — the bank side shows just the monthly lump bill
+payment to the issuer ("Entercard Norge"). Statement PDFs are therefore
+imported by hand:
+
+```
+data/cards/remember/<anything>.pdf       <- drop the statement PDF in
+data/cards/remember/parsed/<stem>.json   <- generated: full fidelity, one per statement
+data/cards/remember/card-analysis.json   <- generated: compact per-month rollup  (~5 KB)
+data/cards/remember/card-merchants.json  <- generated: merchant-level detail    (~12 KB)
+```
+
+**All three JSON forms are written on every run**, including by the
+standalone command below — parsing a local PDF costs no bank API quota, so
+there is no reason to make it opt-in.
+
+### Answering a card question without burning tokens
+
+Read `card-analysis.json`. It has per-month spend, category totals,
+cardholder split, the statement/reconciliation chain, coverage, and FX
+purchases — enough for almost any follow-up, at roughly a tenth the size of
+the per-statement `parsed/*.json` and a nineteenth of the PDFs. Go to
+`card-merchants.json` only for a merchant-specific question ("how much at
+REMA this quarter"); it is ~3x the summary's size and the two files share no
+data, so reading both is never necessary for a question the summary answers.
+**Never** extract text from the PDFs to answer a question — that is the most
+expensive path and the parsed JSON is authoritative.
+
+Regenerate the JSON without producing a report (no bank calls at all):
+
+```bash
+uv run python skills/finance-report/scripts/cards.py          # all cards
+uv run python skills/finance-report/scripts/cards.py --refresh  # re-parse unchanged PDFs
+```
+
+`scripts/cards.py` parses them **positionally**, not by regex over flat
+text: the statement has two right-aligned amount columns (`Beløp` = a
+charge, `Innbetalt` = a payment in) that `extract_text()` collapses into
+indistinguishable trailing numbers. Column x-bands are measured constants
+at the top of the file. It also handles Norwegian number format
+(`23 203,91`), thousands groups split across word tokens (`1` + `714,00`),
+multi-line FX detail (`686,700 EUR Kurs 11,190`), per-cardholder sections,
+and page furniture that otherwise gets appended to the previous
+transaction's description.
+
+**Every statement is reconciled against its own printed subtotals** —
+per-cardholder `BENYTTET KREDITT I PERIODEN`, `Brukt i fakturaperioden`,
+and `Innbetalinger i perioden`. A mismatch over 0.02 raises
+`StatementParseError` and aborts the run. This is deliberate: a layout
+change that silently half-parsed a statement would understate spending,
+which is worse than no report.
+
+Two counting rules, both consequential:
+
+- **Decompose, don't add.** The lump bill payment is reclassified to
+  `credit_card_settlement` and excluded from spend exactly the way
+  `internal_transfer` already is — *not deleted*, so the cash movement
+  stays auditable in the data. The card's purchases become the expense
+  figures. Counting both would double-count the same money.
+- **Attributed by purchase date (`Bruksdato`)**, not bill date. A 20 Aug
+  purchase is August spend even though the bill cleared 15 Sep. A month's
+  card spend therefore will **not** equal that month's bill payment; the
+  report shows both side by side rather than letting that surprise you.
+
+Consequences worth knowing:
+
+- A bill payment whose amount matches no statement in `data/cards/` is
+  flagged in the report rather than silently assumed. This is normal at
+  the start of a range — the first payment in it usually settles a
+  statement from before the range.
+- A month in the report range with **no** covering statement keeps its lump
+  bill as a plain `credit_card` expense instead of being decomposed, and
+  says so in the report and the email. Only a month with itemized purchases
+  to put in its place has its lump reclassified — otherwise the automated
+  monthly run would silently understate expenses by an entire card bill,
+  since on the 1st the statement covering the month just ended usually is
+  not in `data/cards/` yet. The month's total stays correct; only its
+  breakdown is coarse.
+- The most recent covered month is flagged as provisional. A purchase made
+  late in a month is often booked the following month and prints on the
+  *next* statement, so that month's card spend can still rise.
+- A card is identified by its folder name under `data/cards/`, and each
+  card gets its own `card-analysis.json`/`card-merchants.json` in that
+  folder. Statements are never pooled across cards.
+- A PDF left directly in `data/cards/` instead of `data/cards/<card>/` is
+  ignored by the glob, so the loader warns about it by name rather than
+  reporting on less data than you think you supplied.
+- Vipps private-person recipients live in
+  `data/cards/person-recipients.json` (a JSON list of lowercase name
+  substrings), **not** in the plugin source — they are real people's names
+  and this repo carries no account data. Without that file a private Vipps
+  payment lands in `uncategorized`, which is visible rather than
+  mis-bucketed. Merchant keywords stay in the source since they are generic
+  retailers, not personal data.
+- Merchant rules live in `CARD_CATEGORY_RULES` in `scripts/categories.py`,
+  grounded in merchants actually seen in these statements rather than a
+  speculative retailer list. Unmatched purchases land in `uncategorized`
+  so they stay visible. `CARD_PERSON_RECIPIENTS` lists known Vipps
+  person-to-person recipients, since Vipps formats a private person and a
+  merchant identically.
+- **Known limitation — mixed coverage skews the predicted total.** If some
+  months in the model's rolling history were decomposed and another kept its
+  lump, `credit_card` and the per-merchant categories are both non-zero in
+  that window. Each month's own breakdown is still internally consistent
+  (never both for the same month), but `predicted_expense_total` sums every
+  category's independent prediction, so it over-predicts by roughly one card
+  bill. The per-category rows in the Predicted card remain individually
+  correct and show which rule fired. Mitigation: keep statements current so
+  coverage is uniform. Not worked around in code — doing so would require
+  the forecast to know these two category sets are alternative
+  representations of the same spending, which is a bigger change than the
+  skew justifies.
+- Switching a lump category to decomposed ones leaves the old
+  `credit_card` entry in the forecast model. `forecast.py` records a zero
+  for any category on record but absent from a month's breakdown, so it
+  correctly decays to a 0 prediction instead of predicting a cost that no
+  longer exists.
 
 ## Loan details
 
@@ -201,6 +327,8 @@ Options:
 | `--refresh` | off | ignore every per-month transaction cache file this range touches AND the balance cache, re-fetch everything live |
 | `--skip-balance` | off | skip the live "balance in hand" lookup — useful if you're rate-limited or just want the cached-only report faster |
 | `--skip-loans` | off | skip the Loan Tracker sheet lookup entirely |
+| `--skip-cards` | off | ignore `data/cards/` statement PDFs; leave the card bill as one lump expense |
+| `--refresh-cards` | off | re-parse every statement PDF even if its parsed JSON is current |
 | `--refresh-loans` | off | ignore the 1-day loan sheet cache, re-fetch it live |
 | `--loan-sheet-account` | whatever's already cached | Google account for the Loan Tracker sheet; only needed the first time or if it changes |
 | `--loan-sheet-id` | whatever's already cached | Drive file id for the Loan Tracker sheet; only needed the first time or if it changes |
@@ -213,13 +341,25 @@ range, with earlier months providing trend context in the charts.
 ## Filename convention
 
 - Data (cache, one file per calendar month, shared across every report that
-  covers that month): `data/<YYYY-MM>-transactions.json`
+  covers that month): `data/<YYYY-MM>-transactions.json`. This is the *raw
+  bank* snapshot, written before credit-card decomposition — never read it
+  for a month's final figures.
+- Final computed figures for a report: `data/<label>-summary.json` —
+  post-decomposition monthly income/expense/net, both breakdowns, signals,
+  balance and card coverage. `notify_email.py` reads this so the email can
+  never disagree with the report, and it is the cheapest artifact to read
+  when revisiting a period already reported on.
 - Balance cache (per account, `BALANCE_CACHE_TTL_MINUTES`-old entries are
   still reused): `data/balance_cache.json`
 - Forecast model (persists across runs, one per currency, not per period):
   `data/forecast_model_<currency>.json`
 - Loan Tracker sheet cache (1-day TTL, one entry regardless of currency):
   `data/loan_tracker_cache.json`
+- Card statements (manual drop-in) and their generated JSON:
+  `data/cards/<card>/*.pdf`, `data/cards/<card>/parsed/<stem>.json`
+  (re-parsed automatically when the PDF's mtime/size changes),
+  `data/cards/<card>/card-analysis.json` (compact rollup — read this one)
+  and `data/cards/<card>/card-merchants.json` (merchant detail)
 - Report: `reports/<label>-<institutions>-<currency>-report.html` — currency
   is part of the filename so that running the same institutions+range for
   two different `--currency` values (e.g. NOK then EUR) writes two separate
@@ -265,9 +405,14 @@ wholesale, it doesn't merge, so omitting a previously-granted scope
 silently drops it).
 
 - **On success**: subject `Finance report ready — <label>`, body has
-  income/expenses/net/savings-rate headline numbers (re-derived from the
-  same `data/<label>-transactions.json` `generate_report.py` just wrote)
-  plus the local report file path.
+  income/expenses/net/savings-rate headline numbers read from
+  `data/<label>-summary.json` (the figures the report itself rendered),
+  plus any card-coverage or balance caveats, plus the local report path.
+  It deliberately does *not* recompute from `data/<label>-transactions.json`
+  — that is the pre-decomposition bank snapshot, and deriving from it made
+  the email contradict the report it announces whenever a card statement
+  had been itemized. There is still a fallback to it for reports generated
+  before summaries existed, and the email labels itself when that happens.
 - **On failure**: subject `Finance report FAILED — <label>`, body has the
   failure reason and the log file path, plus a remediation hint for the
   most likely cause (expired bank consent).
