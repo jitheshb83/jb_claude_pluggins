@@ -1,400 +1,86 @@
 ---
 name: finance-report
-description: Generates a local HTML financial report (income/expense trend, income splits, category breakdown, month-over-month signals, live balance-in-hand, and a next-month expense/income forecast) from linked bank accounts (DNB, Nordea, Revolut via jb_gateway_mcp) plus manually-imported credit-card statement PDFs (re:member/Entercard), and caches the underlying data + a persisted forecast model under ~/Documents/MyFinance/ for reuse without re-hitting the bank API. Can run unattended via a scheduled launchd job (see launchd/) that auto-generates the report for the prior month on the 1st of each month and emails a success/failure status notification via Gmail. Use when asked for a spending/usage report, financial statistics, expense or income breakdown, budget trends, current balance, a prediction of next month's expenses, to import or analyze a credit-card statement, or to set up/check/troubleshoot the monthly automated report.
+description: Generates a local HTML financial report and the compact JSON behind it — income/expense trend, category breakdown, how you paid (credit card vs each bank account), month-over-month signals, live balance-in-hand, loan details, and a next-month forecast. Sources are linked bank accounts (DNB, Nordea, Revolut via jb_gateway_mcp) plus credit-card statement PDFs imported by hand (re:member/Entercard), cached under ~/Documents/MyFinance/ so repeat questions never re-hit the bank API. Use this skill for ANY question about this user's own money, even when they never say the word report — where their money went, how much they spent on groceries or travel or a named merchant, what they put on the card versus the bank, spending or income breakdowns, budget trends, savings rate, current balance, next month's predicted expenses, a loan or mortgage balance or payment date, importing or analyzing a card statement, or setting up and troubleshooting the automated monthly run. Prefer it over querying bank tools directly, because the cached JSON usually answers the question outright for a fraction of the tokens and without spending the day's API quota.
 ---
 
 # Generating a personal finance report
 
-Turns linked bank transaction data into a local HTML report with charts
-(income vs. expense trend, net cash flow, expense category breakdown,
-income breakdown, a month-over-month table, a live "balance in hand"
-figure, and a rule-based prediction of next month's income/expenses) plus a
-JSON data cache, both saved under `~/Documents/MyFinance/` so they persist
-across sessions and don't need to be regenerated from scratch every time.
-See `~/Documents/MyFinance/README.md` for the on-disk convention.
+Turns linked bank data and credit-card statement PDFs into a local HTML
+report plus compact JSON, under `~/Documents/MyFinance/`. Everything
+persists, so most questions are answered by reading a small file rather
+than regenerating anything. See `~/Documents/MyFinance/README.md` for the
+on-disk convention.
 
 **Prerequisite**: `jb_gateway_mcp` installed standalone and at least one
-bank institution connected via this plugin's `connect-bank-account` skill.
-For the optional email notification step, a Google account with
-`gmail.send` connected via the separate `jb-google-notify-plugin`'s
-`connect-google-account` skill.
+institution connected via this plugin's `connect-bank-account` skill. The
+optional status email also needs `gmail.send` via the
+`jb-google-notify-plugin`'s `connect-google-account` skill.
 
-Do the manual walkthrough (like the one that produced the first report in
-this project's history) only if this script doesn't fit — e.g. a currency
-this script doesn't chart, or a one-off question that doesn't warrant a
-saved report. For anything that matches "give me a report/stats for
-period X", use the script; it's cheaper in tokens and already verified
-against live data.
+## Answer from the cached JSON before running anything
 
-## What it does
+Two scarce resources shape how this skill should be used: Enable Banking
+enforces a **daily** per-consent access cap (not a burst limit — a 429
+means today's quota for that institution is gone), and every file read
+costs context. Both point the same way: read the smallest artifact that
+answers the question, and only generate when something is genuinely
+missing.
 
-`scripts/generate_report.py`:
+| Question | Read this | Not this |
+|---|---|---|
+| Figures for a period already reported | `data/<label>-summary.json` | the HTML, or raw month caches |
+| Card spend, categories, cardholder split | `data/cards/<card>/card-analysis.json` (~5 KB) | the statement PDFs (~500 KB) |
+| One merchant's history | `data/cards/<card>/card-merchants.json` | the PDFs |
+| A month's raw transactions | `data/<YYYY-MM>-transactions.json` | a live re-fetch |
 
-1. **Checks the cache first, per calendar month.** The requested range is
-   split into calendar-month windows; any month that already has
-   `~/Documents/MyFinance/data/<YYYY-MM>-transactions.json` is read from
-   there — no API call — and only genuinely missing months are fetched
-   live (each newly-fetched full month gets its own cache file too, so a
-   later overlapping request reuses it). A partial month (range doesn't
-   start on the 1st / end on the last day) is never cached under a month
-   key — caching a partial slice there would silently corrupt later
-   lookups for that month — so it's always fetched fresh. Pass `--refresh`
-   to ignore all cache files for this run and re-fetch every month live.
-   This matters in practice: Enable Banking enforces a **daily**
-   per-consent access cap (PSD2 "consented multiplicity without PSU
-   involvement per day"), not a short burst limit — a 429 here means
-   today's quota for that institution is spent, not "wait a few minutes."
-   Reusing already-fetched months is the only way to avoid re-hitting it
-   for data you already have.
-2. **Otherwise fetches live**, directly via the stored Enable Banking
-   credentials (same pattern as `connect-bank-account/scripts/check_bank_status.py`
-   — imports `jb_gateway_mcp.adapters.enable_banking` and calls it directly,
-   *not* through the MCP protocol, so it runs standalone).
-3. **Categorizes** every transaction with keyword rules in `scripts/categories.py`
-   (mortgage, credit_card, salary, insurance, etc. — extend that file as new
-   recurring counterparties show up; unmatched transactions land in
-   `income_other`/`uncategorized` so they stay visible rather than being
-   silently mis-bucketed).
-4. **Computes** monthly income/true-expense/net **and a category breakdown
-   for both sides** (expenses *and* income — salary vs. pension/benefit vs.
-   dividend vs. other) per currency. "True" expense excludes
-   `internal_transfer` (money moved between the user's own accounts,
-   detected by matching the counterparty name against the linked accounts'
-   own names), so a self-transfer never gets counted as spend or income.
-5. **Flags signals**: any expense category that stopped, newly appeared, or
-   moved ≥15% month over month — purely rule-based, no LLM judgment baked
-   into the script.
-6. **Fetches balance** ("balance in hand") for every account in the
-   requested currency — never read from the cached transaction snapshot,
-   since a balance is inherently "right now," not history, but reused from
-   a short-lived per-account cache (`data/balance_cache.json`,
-   `BALANCE_CACHE_TTL_MINUTES` = 60) rather than re-fetched live on every
-   run — a personal balance figure doesn't need second-by-second
-   freshness, and re-fetching it needlessly eats into the same daily
-   per-institution quota transactions do. `--refresh` forces a live
-   re-fetch regardless of cache age (same flag that forces transactions to
-   re-fetch). One account failing (expired session, rate limit) prints a
-   warning and is excluded from the total rather than failing the whole
-   report; skip this step entirely with `--skip-balance`.
-7. **Updates a persisted forecast model** (`scripts/forecast.py`) — see
-   "Forecasting" below — and renders its prediction for the month *after*
-   the report's focus month.
-8. **Renders** the HTML report and writes both files under
-   `~/Documents/MyFinance/{data,reports}/`.
-9. **Adds a "Loan details" card** from a manually-maintained Loan Tracker
-   Google Sheet (`scripts/loans.py`) — see "Loan details" below. Purely
-   informational: it never changes the forecast model or the Predicted
-   card's numbers, only adds a cross-reference note next to a matching
-   category's prediction.
+`<label>-summary.json` holds the **final** post-decomposition figures —
+monthly income/expense/net, both breakdowns, signals, balance, payment-method
+split and card coverage. `<YYYY-MM>-transactions.json` is the *raw bank*
+snapshot written before card decomposition, so never quote a month's
+headline figures from it.
 
-10. **Decomposes the credit card** from statement PDFs under
-    `data/cards/` (`scripts/cards.py`) — see "Credit-card statements"
-    below. Unlike the Loan details card, this one *does* change the
-    headline numbers: it replaces the lump bill payment with the card's
-    real spending categories.
+Never extract text from a statement PDF to answer a question: the parsed
+JSON is authoritative and ~90x cheaper.
 
-## Credit-card statements (no API)
+Generate a fresh report when the user asks for one, when the period has
+never been reported, or when new statement PDFs have landed. A manual
+walkthrough is only worth it for something the script genuinely can't do —
+an uncharted currency, or a one-off that doesn't warrant a saved report.
 
-Enable Banking exposes only *payment* accounts, so a credit card's itemized
-purchases are unreachable — the bank side shows just the monthly lump bill
-payment to the issuer ("Entercard Norge"). Statement PDFs are therefore
-imported by hand:
+## What a run does
 
-```
-data/cards/remember/<anything>.pdf       <- drop the statement PDF in
-data/cards/remember/parsed/<stem>.json   <- generated: full fidelity, one per statement
-data/cards/remember/card-analysis.json   <- generated: compact per-month rollup  (~5 KB)
-data/cards/remember/card-merchants.json  <- generated: merchant-level detail    (~12 KB)
-```
+`scripts/generate_report.py`, in order:
 
-**All three JSON forms are written on every run**, including by the
-standalone command below — parsing a local PDF costs no bank API quota, so
-there is no reason to make it opt-in.
-
-### Answering a card question without burning tokens
-
-Read `card-analysis.json`. It has per-month spend, category totals,
-cardholder split, the statement/reconciliation chain, coverage, and FX
-purchases — enough for almost any follow-up, at roughly a tenth the size of
-the per-statement `parsed/*.json` and a nineteenth of the PDFs. Go to
-`card-merchants.json` only for a merchant-specific question ("how much at
-REMA this quarter"); it is ~3x the summary's size and the two files share no
-data, so reading both is never necessary for a question the summary answers.
-**Never** extract text from the PDFs to answer a question — that is the most
-expensive path and the parsed JSON is authoritative.
-
-Regenerate the JSON without producing a report (no bank calls at all):
-
-```bash
-uv run python skills/finance-report/scripts/cards.py          # all cards
-uv run python skills/finance-report/scripts/cards.py --refresh  # re-parse unchanged PDFs
-```
-
-`scripts/cards.py` parses them **positionally**, not by regex over flat
-text: the statement has two right-aligned amount columns (`Beløp` = a
-charge, `Innbetalt` = a payment in) that `extract_text()` collapses into
-indistinguishable trailing numbers. Column x-bands are measured constants
-at the top of the file. It also handles Norwegian number format
-(`23 203,91`), thousands groups split across word tokens (`1` + `714,00`),
-multi-line FX detail (`686,700 EUR Kurs 11,190`), per-cardholder sections,
-and page furniture that otherwise gets appended to the previous
-transaction's description.
-
-**Every statement is reconciled against its own printed subtotals** —
-per-cardholder `BENYTTET KREDITT I PERIODEN`, `Brukt i fakturaperioden`,
-and `Innbetalinger i perioden`. A mismatch over 0.02 raises
-`StatementParseError` and aborts the run. This is deliberate: a layout
-change that silently half-parsed a statement would understate spending,
-which is worse than no report.
-
-Two counting rules, both consequential:
-
-- **Decompose, don't add.** The lump bill payment is reclassified to
-  `credit_card_settlement` and excluded from spend exactly the way
-  `internal_transfer` already is — *not deleted*, so the cash movement
-  stays auditable in the data. The card's purchases become the expense
-  figures. Counting both would double-count the same money.
-- **Attributed by purchase date (`Bruksdato`)**, not bill date. A 20 Aug
-  purchase is August spend even though the bill cleared 15 Sep. A month's
-  card spend therefore will **not** equal that month's bill payment; the
-  report shows both side by side rather than letting that surprise you.
-
-Consequences worth knowing:
-
-- A bill payment whose amount matches no statement in `data/cards/` is
-  flagged in the report rather than silently assumed. This is normal at
-  the start of a range — the first payment in it usually settles a
-  statement from before the range.
-- A month in the report range with **no** covering statement keeps its lump
-  bill as a plain `credit_card` expense instead of being decomposed, and
-  says so in the report and the email. Only a month with itemized purchases
-  to put in its place has its lump reclassified — otherwise the automated
-  monthly run would silently understate expenses by an entire card bill,
-  since on the 1st the statement covering the month just ended usually is
-  not in `data/cards/` yet. The month's total stays correct; only its
-  breakdown is coarse.
-- The most recent covered month is flagged as provisional. A purchase made
-  late in a month is often booked the following month and prints on the
-  *next* statement, so that month's card spend can still rise.
-- A card is identified by its folder name under `data/cards/`, and each
-  card gets its own `card-analysis.json`/`card-merchants.json` in that
-  folder. Statements are never pooled across cards.
-- A PDF left directly in `data/cards/` instead of `data/cards/<card>/` is
-  ignored by the glob, so the loader warns about it by name rather than
-  reporting on less data than you think you supplied.
-- Vipps private-person recipients live in
-  `data/cards/person-recipients.json` (a JSON list of lowercase name
-  substrings), **not** in the plugin source — they are real people's names
-  and this repo carries no account data. Without that file a private Vipps
-  payment lands in `uncategorized`, which is visible rather than
-  mis-bucketed. Merchant keywords stay in the source since they are generic
-  retailers, not personal data.
-- Merchant rules live in `CARD_CATEGORY_RULES` in `scripts/categories.py`,
-  grounded in merchants actually seen in these statements rather than a
-  speculative retailer list. Unmatched purchases land in `uncategorized`
-  so they stay visible. `CARD_PERSON_RECIPIENTS` lists known Vipps
-  person-to-person recipients, since Vipps formats a private person and a
-  merchant identically.
-- **Known limitation — mixed coverage skews the predicted total.** If some
-  months in the model's rolling history were decomposed and another kept its
-  lump, `credit_card` and the per-merchant categories are both non-zero in
-  that window. Each month's own breakdown is still internally consistent
-  (never both for the same month), but `predicted_expense_total` sums every
-  category's independent prediction, so it over-predicts by roughly one card
-  bill. The per-category rows in the Predicted card remain individually
-  correct and show which rule fired. Mitigation: keep statements current so
-  coverage is uniform. Not worked around in code — doing so would require
-  the forecast to know these two category sets are alternative
-  representations of the same spending, which is a bigger change than the
-  skew justifies.
-- Switching a lump category to decomposed ones leaves the old
-  `credit_card` entry in the forecast model. `forecast.py` records a zero
-  for any category on record but absent from a month's breakdown, so it
-  correctly decays to a 0 prediction instead of predicting a cost that no
-  longer exists.
-
-## "How you paid" — payment-method split
-
-`payment_method_breakdown` splits the focus month's expenses by the
-instrument the money left from, and renders a share bar, a per-source table
-and a **category × source matrix**. It answers "what did I actually put on
-the card" — a different question from the category breakdown, not a
-restatement of it.
-
-- Card pseudo-institutions are told apart from real accounts by *absence*
-  from `dataset["accounts"]`, so no card name is hardcoded.
-- The monthly card bill itself is excluded (it is
-  `credit_card_settlement`), since the purchases it settles are already
-  counted. The method totals therefore sum exactly to the month's
-  `true_expense`.
-- Also written to `data/<label>-summary.json` under `payment_methods`, so
-  the split is available for later analysis without re-reading the report.
-
-## Categorization is derived, not stored
-
-`recategorize()` re-derives every bank transaction's category from its
-cached raw fields (counterparty, description, direction) after the per-month
-caches are merged, and reports how many changed.
-
-`build_dataset` bakes a category in at fetch time and the cache stores it,
-so without this pass an improved rule in `categories.py` would only affect
-months fetched *after* the change — correcting an older month would mean
-re-fetching it live and spending that institution's daily API quota on data
-already sitting on disk. Treating the category as derived makes a rule fix
-retroactive and free. Card lines are categorized separately by
-`categorize_card` and are skipped here.
-
-Two rules worth knowing about, both added because the bank and card sides
-disagreed about the same money:
-
-- `top-up by *` → `internal_transfer`. Funding a linked account from the
-  user's own credit card. The card side already books the outgoing leg as
-  an internal transfer; without this the arriving money counted as *income*
-  as well, and the eventual purchase counted as spend.
-- `categorize()` now takes the same `person_recipients` list as
-  `categorize_card`, so paying a given person is categorized the same way
-  whether it left the card or a bank account.
-
-## Report rendering & interaction
-
-The HTML is interactive by default — all inline, no CDN and no network
-requests, since the page holds real account data and must work offline.
-
-- **Hover/focus tooltips on every mark** (bars, category rows, method
-  segments). Values come from a `data-tip` attribute and are inserted with
-  `textContent` only — a merchant or category name originates in bank/PDF
-  data and is never trusted as markup. Keyboard focus shows exactly what
-  hover shows; Escape dismisses.
-- **Chart/Table toggle per chart.** Every chart ships a table twin, so a
-  tooltip only ever enhances a value and never gates it.
-- **Theme toggle** (auto → light → dark), remembered in `localStorage` and
-  wrapped in try/catch so a private window still renders.
-- **The long category list folds** to the top 10 with a show-all button;
-  the table view always holds every row.
-
-Rules the renderer follows, each of which it previously broke:
-
-- **No one-bar charts.** A single-month range renders the figures plus a
-  note instead of a one-column chart — a single column implies a
-  comparison the data cannot make, which is what made single-month reports
-  look broken.
-- **Values live on a y-axis, not on every bar cap.** Per-bar labels
-  collided (two ~45px numbers over a ~50px pair). The axis rounds up to a
-  clean 1/1.5/2/2.5/3/4/5/6/8/10 × 10ⁿ step via `_nice_ceiling`.
-- **Text never wears the series colour.** The net and savings figures used
-  to be painted red/green; the sign carries direction and the coloured mark
-  beside the text carries identity.
-- **Theme tokens live on `.viz-root`**, so the page background and text
-  colour must be painted there too — setting them on `body` silently failed
-  because custom properties only inherit *downward*, which left a white
-  page behind dark cards and a near-invisible heading.
-- **Modifier class names are namespaced** (`pm-bank`/`pm-card`). A swatch
-  marked `class="sw card"` picked up the report's own `.card` component
-  padding and border and rendered a 9px swatch as a ~53px block.
-- **Bank-vs-card colour is the validated categorical pair** (slot 7 violet
-  / slot 3 aqua), deliberately not the income/expense pair — both of those
-  series *are* expenses here. In-fill label ink is picked per mode by
-  measured contrast (white on violet 8.56:1; ink on aqua 6.99:1), and an
-  in-segment label is only drawn above 12% width so it is never clipped.
-
-The palette is the dataviz reference instance; re-validate with that
-skill's `validate_palette.js` before changing any series colour.
-
-## Loan details
-
-Enable Banking (this skill's only bank data source) doesn't expose loan or
-mortgage accounts — PSD2's Account Information Service scope is legally
-limited to payment accounts, confirmed live against this user's own DNB/
-Nordea consents (see jb_gateway_mcp's project memory "Loan Tracker sheet"
-for the full investigation). Loan/financing details are instead tracked by
-hand in a Google Sheet and read via `scripts/loans.py`:
-
-- Cached locally at `~/Documents/MyFinance/data/loan_tracker_cache.json`
-  for **1 day** — a repeat run within that window never calls the Drive
-  API, matching the `balance_cache.json` pattern above. Pass
-  `--refresh-loans` to force a live re-fetch regardless of cache age.
-- `--loan-sheet-account`/`--loan-sheet-id` only need to be passed once (or
-  whenever they change) — once cached, later runs reuse the stored
-  `source_account`/`source_file_id` automatically.
-- Deliberately calls Drive's export endpoint directly with
-  `mimeType="text/csv"` rather than going through
-  `jb_gateway_mcp.adapters.google_drive.read_file` — that function
-  hardcodes `text/plain`, which Drive's export API rejects for
-  spreadsheets specifically (400 "requested conversion is not supported").
-  `text/csv` is the correct format there, and only ever returns the
-  sheet's first/active tab.
-- The sheet's own number/date formatting (currency-symbol-prefixed
-  amounts, DD/MM/YYYY dates) is deliberately left as-is at the source —
-  `loans.py` parses amounts/rates into floats on the way in (tolerant of
-  both US-style `393,507.39` and EU-style `393.507,39` grouping, since a
-  sheet's regional format isn't something to assume), but dates are shown
-  verbatim in the report. All free-text sheet fields (institution, loan
-  type, notes, etc.) are HTML-escaped before rendering — a sheet is
-  external input, not code-controlled text like `CATEGORY_LABELS`.
-- The Predicted card's `mortgage`/`car_finance` rows (see "Forecasting"
-  below) get an extra note per matching loan, e.g.
-  `Loan Tracker (DNB): 12,500 NOK due 01/09/2026` — informational
-  cross-reference only, never used to change `predicted_next` or
-  `method`. If more than one loan shares a type (e.g. two car loans from
-  different institutions), each gets its own note rather than one
-  clobbering the other.
-- **Stale-sheet fallback**: if a loan row's `last_updated` is more than 30
-  days old (or missing) — or `monthly_payment`/`next_payment_date` is
-  simply blank — those two fields fall back to a value derived from actual
-  transaction history: `monthly_payment` from the matching category's own
-  `forecast.py` prediction, `next_payment_date` from the most recent
-  matching transaction's date plus one month. Each field is tagged
-  `(est.)` independently — in both the Loan details card and the
-  Predicted card's cross-reference note — so an estimated value is never
-  confused with an actual sheet-sourced fact, and a row where only one of
-  the two fields was estimated doesn't mislabel the other.
-  `outstanding_balance`, `interest_rate_pct`, `original_amount`, and
-  `maturity_date` are **never** estimated this way — transaction history
-  has no honest way to recover a loan's actual principal, rate, or term,
-  so a stale/blank value there is shown as-is (or `?`), not guessed.
-- Skip this step entirely with `--skip-loans`.
-
-## Forecasting
-
-`scripts/forecast.py` keeps one small state file per currency —
-`~/Documents/MyFinance/data/forecast_model_<currency>.json` — that
-persists **across report runs**, not just within one. Every time
-`generate_report.py` runs for a currency, it merges that run's per-category
-monthly totals into the model's rolling history (last 6 months per
-category), recomputes each category's prediction, and rewrites the file.
-This is the "keep the logic local and update it looking at each new report"
-behavior — the model accumulates, it doesn't restart from zero each time.
-
-The rule per category (deliberately simple and auditable, not ML):
-
-- Take the last up to 3 non-zero months on record.
-- If the category had a non-zero value before but is 0 in the latest month
-  → **`stopped`**, predict 0.
-- Else if ≥2 non-zero points and their relative spread (population stdev /
-  mean) is ≤5% → **`fixed`**, predict the latest observed value.
-- Else if ≥2 non-zero points but more spread → **`average`**, predict the
-  trailing mean.
-- Else if exactly 1 point ever seen → **`single_observation`**, predict
-  that value (low confidence — noted as such in the report).
-
-Income gets the same treatment as one series (not split by category) for
-the "predicted income" figure. The report's "Predicted — `<next month>`"
-card shows every category's prediction next to its method, so the logic is
-always visible, not a black box — if a prediction looks wrong, the reason
-(which rule fired, on what history) is right there in the table, and the
-underlying file is a plain JSON you can open directly.
-
-**Extending/correcting it**: edit `FIXED_RELATIVE_STDEV` or
-`MAX_HISTORY_MONTHS` in `forecast.py` if the 5%-variance or 6-month-window
-defaults stop feeling right; both are single constants at the top of the
-file. To reset a currency's model (e.g. after a life change that makes old
-history misleading), delete `forecast_model_<currency>.json` — it gets
-rebuilt from whatever's in `data/*.json` the next time the script runs for
-that currency (though only categories from ranges you've actually
-generated a report for; it doesn't backfill from raw history you haven't
-fetched).
+1. **Reuses the per-month cache**, fetching live only the months genuinely
+   missing. A partial month is never cached under a month key — a partial
+   slice there would silently corrupt later lookups for that month.
+2. **Fetches live** via stored Enable Banking credentials, importing
+   `jb_gateway_mcp.adapters.enable_banking` directly rather than through
+   the MCP protocol, so it runs standalone — the same pattern as
+   `connect-bank-account/scripts/check_bank_status.py`.
+3. **Re-derives every category** from the cached raw fields, so a rule fix
+   applies retroactively and for free → `references/categorization.md`.
+4. **Decomposes the credit card** from statement PDFs, replacing the lump
+   bill with real categories → `references/cards.md`. This one changes the
+   headline numbers.
+5. **Computes** monthly income / true expense / net and a breakdown of
+   both sides per currency. "True" excludes `internal_transfer` and
+   `credit_card_settlement` — moves between the user's own instruments are
+   neither income nor spend.
+6. **Flags signals**: a category that stopped, newly appeared, or moved
+   ≥15% month over month. Purely rule-based, no LLM judgment in the script.
+7. **Splits expenses by payment instrument** — card vs each bank account
+   → `references/rendering.md`.
+8. **Fetches balance in hand**, live but reused from a 60-minute per-account
+   cache; one account failing is a warning, not a failed report.
+   `--skip-balance` skips it.
+9. **Updates the persisted forecast** and predicts the following month →
+   `references/forecasting.md`.
+10. **Adds loan details** from the Loan Tracker sheet → `references/loans.md`.
+    Informational only; never changes the forecast.
+11. **Writes** the HTML, `<label>-summary.json`, and the card JSON.
 
 ## Running it
+
 
 Run from this plugin's root directory (the directory containing this
 skill's parent `skills/` folder and this plugin's `pyproject.toml`):
@@ -427,6 +113,7 @@ range, with earlier months providing trend context in the charts.
 
 ## Filename convention
 
+
 - Data (cache, one file per calendar month, shared across every report that
   covers that month): `data/<YYYY-MM>-transactions.json`. This is the *raw
   bank* snapshot, written before credit-card decomposition — never read it
@@ -455,135 +142,16 @@ range, with earlier months providing trend context in the charts.
   full calendar month, `YYYY-MM_to_YYYY-MM` for several full calendar
   months, or the literal ISO dates if the range isn't month-aligned.
 
-## Automating it monthly (launchd)
+## Reference files
 
-`scripts/run_monthly.sh` computes "last calendar month" relative to today
-(BSD `date -v` arithmetic — macOS only) and runs `generate_report.py` for
-exactly that month, logging everything to
-`~/Documents/MyFinance/logs/<label>-run-<timestamp>.log` since it's meant
-to run unattended. `launchd/com.jbgatewaymcp.financereport.monthly.plist`
-is the tracked template that schedules it for 08:00 on the 1st of every
-month (`StartCalendarInterval` with `Day: 1`). After `generate_report.py`
-finishes, it also emails a short status notification via
-`scripts/notify_email.py` — see "Email notifications" below.
+Read the one that matches the task rather than all of them — each is
+self-contained, and loading them all would cost more than the report.
 
-`run_monthly.sh` resolves its own plugin root at runtime, so it works
-wherever this plugin was actually installed — no path editing needed there.
-Two things in this section *do* need editing for your own setup:
-`FROM_ACCOUNT`/`TO_ADDRESS` near the top of `run_monthly.sh`, and the
-`__PLUGIN_ROOT__`/`__HOME__` placeholders in the plist (see "Install"
-below).
-
-### Email notifications
-
-`scripts/notify_email.py` sends via the Gmail adapter directly (same
-direct-adapter-call pattern `generate_report.py` uses for bank data — not
-through the MCP protocol, so it works standalone). Takes `--from-account`
-and `--to-address` explicitly (both required — there's no baked-in
-default); `run_monthly.sh` passes these from its own `FROM_ACCOUNT`/
-`TO_ADDRESS` variables, which you should edit for your own accounts.
-Requires the `gmail.send` OAuth scope on the stored Google token (onboarded
-via the `jb-google-notify-plugin`'s `connect-google-account` skill), which
-is **not** part of `onboard-google`'s default read-only scope set — if you
-see `403 Insufficient Permission`, re-run `onboard-google` including
-`https://www.googleapis.com/auth/gmail.send` alongside the existing
-readonly scopes (all of them — re-consenting replaces the stored token
-wholesale, it doesn't merge, so omitting a previously-granted scope
-silently drops it).
-
-- **On success**: subject `Finance report ready — <label>`, body has
-  income/expenses/net/savings-rate headline numbers read from
-  `data/<label>-summary.json` (the figures the report itself rendered),
-  plus any card-coverage or balance caveats, plus the local report path.
-  It deliberately does *not* recompute from `data/<label>-transactions.json`
-  — that is the pre-decomposition bank snapshot, and deriving from it made
-  the email contradict the report it announces whenever a card statement
-  had been itemized. There is still a fallback to it for reports generated
-  before summaries existed, and the email labels itself when that happens.
-- **On failure**: subject `Finance report FAILED — <label>`, body has the
-  failure reason and the log file path, plus a remediation hint for the
-  most likely cause (expired bank consent).
-- **Deliberately NOT the full report or transaction detail** — only
-  headline numbers, to avoid duplicating sensitive financial detail into
-  an email inbox beyond what's necessary. The full report always stays
-  local; the email just says a new one exists (or doesn't) and why.
-- `run_monthly.sh` is **not** `set -e` — a failing `generate_report.py`
-  must still reach the failure-email branch below it, not abort the
-  script first. The script's final `exit "$REPORT_EXIT"` deliberately
-  preserves the *report generation's* exit code as the job's result even
-  though the notification step runs after it — so launchd's "last exit
-  code" always reflects whether the report itself succeeded, never masked
-  by the email step's own success or failure.
-- Manual/ad-hoc report generation (e.g. Claude building a report
-  mid-conversation) never emails anything — only `run_monthly.sh` calls
-  `notify_email.py`, by design, so on-demand use doesn't spam an inbox. For
-  an ad-hoc "email me this report" request instead, use the
-  `jb-google-notify-plugin`'s `report-notifier` agent.
-
-**Install** (the live copy lives outside any repo, in
-`~/Library/LaunchAgents/` — OS-specific, not version-controlled itself,
-hence the tracked template here). First substitute the placeholders in the
-plist for this plugin's actual install path and your home directory:
-
-```bash
-PLUGIN_ROOT="$(pwd)"   # run this from the plugin root, see "Running it" above
-sed -e "s|__PLUGIN_ROOT__|$PLUGIN_ROOT|g" -e "s|__HOME__|$HOME|g" \
-   skills/finance-report/launchd/com.jbgatewaymcp.financereport.monthly.plist \
-   > ~/Library/LaunchAgents/com.jbgatewaymcp.financereport.monthly.plist
-launchctl bootstrap gui/$(id -u) \
-   ~/Library/LaunchAgents/com.jbgatewaymcp.financereport.monthly.plist
-```
-
-**Verify without waiting for the 1st**:
-`launchctl kickstart -p gui/$(id -u)/com.jbgatewaymcp.financereport.monthly`,
-then check the newest file in `~/Documents/MyFinance/logs/` and
-`launchctl print gui/$(id -u)/com.jbgatewaymcp.financereport.monthly | grep "last exit"`
-(0 = success; anything else, read the log).
-
-**Uninstall**:
-`launchctl bootout gui/$(id -u)/com.jbgatewaymcp.financereport.monthly`,
-then delete the plist from `~/Library/LaunchAgents/`.
-
-**If you move/reinstall this plugin to a different path**, the installed
-plist does *not* follow it — `ProgramArguments` bakes in the absolute
-`__PLUGIN_ROOT__` path at install time (see the `sed` step above), it
-doesn't re-resolve at runtime. A plugin move without reinstalling the
-plist leaves `launchctl` pointing at a script that no longer exists there
-— the job fails silently (check `last exit code` per "Verify" above) with
-no error surfaced anywhere else. Re-run the **Install** steps above
-(bootout the old one, regenerate the plist from the new `PLUGIN_ROOT`,
-bootstrap it) any time the plugin's install location changes.
-
-**The gotcha that will eat an hour if you hit it blind**: a fresh
-`launchd`-spawned process has **no access to `~/Documents`** by default —
-macOS TCC (privacy protection) blocks it, even though your interactive
-shell/IDE already has that access and so doesn't notice anything's wrong
-when you test the script by hand. The failure mode is deceptive:
-`/bin/zsh: can't open input file: ...` even when the file demonstrably
-exists and is executable, or `Operation not permitted` on a plain `ls` of
-the very same directory a normal terminal can read fine. Diagnosed by
-running an isolated LaunchAgent that just `ls`s the target directory to
-`/tmp` — confirms it's TCC, not a script bug, in one shot if you hit this
-again on a fresh machine.
-
-**Fix**: System Settings → Privacy & Security → Full Disk Access → add
-`/bin/zsh` (Cmd+Shift+G to type the path), toggle it on. This is what
-`ProgramArguments` in the plist invokes as the interpreter, so it's the
-binary that needs the grant — not the script file itself, and not
-`launchd`. Worth knowing this is a **broad** grant (every zsh script on
-the machine gets `~/Documents` access, not just this job) — the
-standard/only practical fix for this scenario on modern macOS, but flag it
-rather than treat it as free.
-
-**Known unresolved gotcha: `notify_email.py` can hang indefinitely under
-launchd.** Triggering the job via `launchctl kickstart` has been observed
-to leave `notify_email.py` running (not exited, not erroring) — most
-likely a one-time macOS Keychain access prompt for the Gmail credential
-that a launchd-spawned process hasn't been granted "Always Allow" for yet,
-which a headless/non-interactive trigger can't answer. `generate_report.py`
-itself completes and writes the report fine either way — only the email
-step is affected. If a run seems stuck, check for a Keychain prompt on
-screen and approve it; `ps aux | grep notify_email` confirms whether it's
-actually hung versus just slow. Not yet fixed as of this writing — treat a
-hung run as a signal to check for that prompt, not as a script bug to
-chase in the code.
+| File | Read it when |
+|---|---|
+| `references/cards.md` | importing a statement, or a card figure looks wrong |
+| `references/categorization.md` | adding or fixing a category rule |
+| `references/rendering.md` | changing anything visual in the HTML |
+| `references/forecasting.md` | a prediction looks wrong |
+| `references/loans.md` | a loan figure is wrong or marked `(est.)` |
+| `references/automation.md` | installing or troubleshooting the monthly job |
