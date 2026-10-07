@@ -6,6 +6,10 @@ requires-python = ">=3.13"
 dependencies = [
     "jb-gateway-mcp @ git+https://github.com/jitheshb83/jb_gateway_mcp.git",
     "httpx>=0.28.1",
+    # credit-card statement PDFs (data/cards/) — positional text extraction;
+    # the statement has two right-aligned amount columns a flat text dump
+    # collapses into indistinguishable trailing numbers.
+    "pdfplumber>=0.11.4",
 ]
 
 [tool.uv]

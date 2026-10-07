@@ -1,7 +1,7 @@
 {
   "name": "jb-finance-mcp-plugin",
-  "description": "Bank account onboarding (DNB, Nordea, Revolut via Enable Banking) and local HTML finance-report generation for jb_gateway_mcp.",
-  "version": "0.2.0",
+  "description": "Bank account onboarding (DNB, Nordea, Revolut via Enable Banking), credit-card statement import, and local HTML finance-report generation for jb_gateway_mcp.",
+  "version": "0.3.0",
   "author": {
     "name": "Jithesh Bharathan",
     "url": "https://github.com/jitheshb83"
@@ -9,5 +9,5 @@
   "homepage": "https://github.com/jitheshb83/jb_claude_pluggins/tree/main/plugins/jb-finance-mcp-plugin",
   "repository": "https://github.com/jitheshb83/jb_claude_pluggins",
   "license": "MIT",
-  "keywords": ["finance", "banking", "enable-banking", "reports", "jb-gateway-mcp"]
+  "keywords": ["finance", "banking", "enable-banking", "credit-card", "reports", "jb-gateway-mcp"]
 }

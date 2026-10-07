@@ -74,7 +74,16 @@ def update_and_predict(out_dir: Path, currency: str, monthly: dict[str, Any]) ->
     model = load_model(out_dir, currency)
     categories = model.setdefault("categories", {})
 
+    # Union with the categories already on record, not just the ones seen in
+    # this run. A category's absence from a month's breakdown means it was
+    # genuinely zero that month, so it has to be *recorded* as zero for
+    # `_predict` to call it "stopped". Iterating only over this run's
+    # categories would instead leave the old history untouched and keep
+    # predicting a cost that no longer exists — which is exactly what
+    # happened when the lump `credit_card` category was replaced by the
+    # decomposed per-merchant categories from the card statements.
     all_cats = {c for m in monthly.values() for c in m["category_breakdown"]}
+    all_cats |= set(categories)
     for cat in all_cats:
         entry = categories.setdefault(cat, {"history": {}})
         new_points = {

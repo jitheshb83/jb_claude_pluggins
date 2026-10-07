@@ -40,19 +40,59 @@ from jb_gateway_mcp.token_lifecycle import NeedsReconsentError
 
 
 def build_success_body(out_dir: Path, label: str, currency: str, report_path: str) -> str:
-    data_path = out_dir / "data" / f"{label}-transactions.json"
-    dataset = json.loads(data_path.read_text())
-    monthly = monthly_summaries_by_currency(dataset)
-    month = sorted(monthly.get(currency, {}))[-1]
-    figures = monthly[currency][month]
+    """Headline numbers for the success email.
+
+    Reads `<label>-summary.json`, the figures generate_report.py actually
+    rendered. Falls back to recomputing from the raw month cache only when
+    that file is absent (a report generated before summaries existed).
+
+    The fallback is genuinely second-best, not just older: the month cache
+    holds pre-decomposition bank data, so for a month whose credit-card
+    statement was itemized it reports the lump card bill as expense and
+    disagrees with the report this email is announcing.
+    """
+    summary_path = out_dir / "data" / f"{label}-summary.json"
+    caveats: list[str] = []
+    if summary_path.exists():
+        summary = json.loads(summary_path.read_text())
+        month = summary["focus_month"]
+        figures = summary["monthly"][month]
+        card = summary.get("card") or {}
+        for uncovered in card.get("uncovered_months", []):
+            caveats.append(
+                f"NOTE: no credit-card statement covered {uncovered}, so its "
+                "card bill is counted as one lump rather than itemized "
+                "categories. The total is right; the breakdown is coarse."
+            )
+        for pending in card.get("spillover_pending_months", []):
+            caveats.append(
+                f"NOTE: {pending} card spend is provisional — purchases made "
+                "late in the month land on the next statement, which was not "
+                "available yet."
+            )
+        for warning in summary.get("balance_warnings", []):
+            caveats.append(f"NOTE: balance lookup issue — {warning}")
+    else:
+        dataset = json.loads((out_dir / "data" / f"{label}-transactions.json").read_text())
+        monthly = monthly_summaries_by_currency(dataset)
+        month = sorted(monthly.get(currency, {}))[-1]
+        figures = monthly[currency][month]
+        caveats.append(
+            "NOTE: figures recomputed from the raw bank snapshot because no "
+            "summary file was written; if this month's credit card was "
+            "itemized, these numbers will differ from the report."
+        )
+
     savings_rate = figures["net"] / figures["income"] * 100 if figures["income"] else 0.0
+    caveat_block = ("\n" + "\n\n".join(caveats) + "\n") if caveats else ""
 
     return (
         f"Finance report generated for {month} ({currency}).\n\n"
         f"Income:       {figures['income']:,.0f}\n"
         f"Expenses:     {figures['true_expense']:,.0f}\n"
         f"Net:          {figures['net']:,.0f}\n"
-        f"Savings rate: {savings_rate:+.1f}%\n\n"
+        f"Savings rate: {savings_rate:+.1f}%\n"
+        f"{caveat_block}\n"
         f"Full report (local file on this machine): {report_path}\n"
         "Not attached or inlined here by design — open it locally for the\n"
         "full category breakdown, income splits, and next-month forecast."
