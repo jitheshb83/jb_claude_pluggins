@@ -451,6 +451,45 @@ def _merge_datasets(
     }
 
 
+def recategorize(dataset: dict[str, Any], person_recipients: tuple[str, ...] = ()) -> int:
+    """Re-derive every bank transaction's category from its raw fields.
+
+    `build_dataset` bakes a category in at fetch time, and the per-month
+    cache stores it. Without this pass, improving a rule in categories.py
+    would only affect months fetched *after* the change — correcting an
+    older month would mean re-fetching it live and spending that
+    institution's daily API quota on data already on disk. The raw fields
+    the rules read (counterparty, description, direction) are all cached, so
+    the category is cheap to recompute and is treated as derived rather than
+    stored.
+
+    Returns how many categories changed, so a rule change is visible rather
+    than silent.
+    """
+    own_names = {
+        account["name"].strip().lower()
+        for accounts in dataset["accounts"].values()
+        for account in accounts
+        if account.get("name")
+    }
+    changed = 0
+    for institution, rows in dataset["transactions"].items():
+        if institution not in dataset["accounts"]:
+            continue  # a card pseudo-institution: categorized by categorize_card
+        for row in rows:
+            fresh = categorize(
+                row["direction"],
+                row.get("counterparty_name"),
+                row.get("description"),
+                own_names,
+                person_recipients,
+            )
+            if fresh != row.get("category"):
+                row["category"] = fresh
+                changed += 1
+    return changed
+
+
 def _months_in_range(date_from: str, date_to: str) -> list[str]:
     start, end = date.fromisoformat(date_from), date.fromisoformat(date_to)
     months, cursor = [], start.replace(day=1)
@@ -653,6 +692,234 @@ def monthly_summaries_by_currency(dataset: dict[str, Any]) -> dict[str, dict[str
     return result
 
 
+def _nice_ceiling(value: float) -> float:
+    """Round an axis maximum up to a clean 1/2/5 × 10^n step.
+
+    Axis ticks have to read as round numbers (0 / 25,000 / 50,000); ticks
+    derived straight from the data maximum give values like 73,044 that
+    nobody can scan."""
+    if value <= 0:
+        return 1.0
+    import math
+
+    exponent = math.floor(math.log10(value))
+    magnitude = 10**exponent
+    for step in (1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10):
+        if value <= step * magnitude:
+            return step * magnitude
+    return 10 * magnitude
+
+
+def _card_with_table(
+    title: str,
+    subtitle: str,
+    chart_html: str,
+    table_html: str,
+    slug: str,
+) -> str:
+    """A chart card plus its table-view twin behind a toggle.
+
+    Every chart ships a table equivalent: a tooltip may enhance a value but
+    must never be the only way to read it, and a colour-coded mark is not an
+    accessible encoding on its own. The table is the WCAG-clean twin, one
+    click away rather than in a separate section.
+    """
+    return f"""
+  <div class="card">
+    <div class="card-head">
+      <div>
+        <h2>{title}</h2>
+        <p class="sub">{subtitle}</p>
+      </div>
+      <div class="viewtoggle" role="group" aria-label="View as">
+        <button type="button" data-view="chart" data-pane="{slug}"
+                aria-pressed="true">Chart</button>
+        <button type="button" data-view="table" data-pane="{slug}"
+                aria-pressed="false">Table</button>
+      </div>
+    </div>
+    <div data-pane-chart="{slug}">{chart_html}</div>
+    <div data-pane-table="{slug}" hidden>{table_html}</div>
+  </div>"""
+
+
+_SCRIPT = r"""
+<script>
+(function () {
+  'use strict';
+
+  // ---- tooltip -----------------------------------------------------------
+  // Values come from data-tip as "value\nlabel" and are inserted with
+  // textContent only: a merchant or category name originates in bank/PDF
+  // data, so it is never trusted as markup.
+  var tip = document.getElementById('tip');
+
+  function showTip(el, x, y) {
+    var raw = el.getAttribute('data-tip');
+    if (!raw) return;
+    var parts = raw.split('\n');
+    tip.textContent = '';
+    var v = document.createElement('div');
+    v.className = 'tip-v';
+    v.textContent = parts[0];
+    tip.appendChild(v);
+    for (var i = 1; i < parts.length; i++) {
+      var k = document.createElement('div');
+      k.className = 'tip-k';
+      k.textContent = parts[i];
+      tip.appendChild(k);
+    }
+    tip.style.opacity = '1';
+    place(x, y);
+  }
+
+  function place(x, y) {
+    var r = tip.getBoundingClientRect();
+    var left = Math.min(Math.max(8, x + 14), window.innerWidth - r.width - 8);
+    var top = y - r.height - 14;
+    if (top < 8) top = y + 18;
+    tip.style.left = left + 'px';
+    tip.style.top = top + 'px';
+  }
+
+  function hideTip() { tip.style.opacity = '0'; }
+
+  document.addEventListener('pointermove', function (e) {
+    var el = e.target.closest ? e.target.closest('[data-tip]') : null;
+    if (el) showTip(el, e.clientX, e.clientY); else hideTip();
+  });
+  document.addEventListener('pointerleave', hideTip);
+
+  // Keyboard parity: focus shows exactly what hover shows.
+  document.addEventListener('focusin', function (e) {
+    var el = e.target.closest ? e.target.closest('[data-tip]') : null;
+    if (!el) return hideTip();
+    var r = el.getBoundingClientRect();
+    showTip(el, r.left + r.width / 2, r.top);
+  });
+  document.addEventListener('focusout', hideTip);
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') hideTip();
+  });
+
+  // ---- chart / table twin ------------------------------------------------
+  document.querySelectorAll('.viewtoggle button').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var pane = btn.getAttribute('data-pane');
+      var wantTable = btn.getAttribute('data-view') === 'table';
+      document.querySelector('[data-pane-chart="' + pane + '"]').hidden = wantTable;
+      document.querySelector('[data-pane-table="' + pane + '"]').hidden = !wantTable;
+      document.querySelectorAll('.viewtoggle button[data-pane="' + pane + '"]')
+        .forEach(function (b) {
+          b.setAttribute('aria-pressed',
+            String((b.getAttribute('data-view') === 'table') === wantTable));
+        });
+      hideTip();
+    });
+  });
+
+  // ---- show-all for the folded category tail ----------------------------
+  var more = document.getElementById('cat-more');
+  if (more) {
+    more.addEventListener('click', function () {
+      var rows = document.querySelectorAll('.hbar-row.tail');
+      var expand = rows.length > 0 && rows[0].hidden;
+      rows.forEach(function (r) { r.hidden = !expand; });
+      more.textContent = more.getAttribute(expand ? 'data-less' : 'data-more');
+    });
+  }
+
+  // ---- theme -------------------------------------------------------------
+  // Three states, because the report is read both ways and the OS setting
+  // should stay the default rather than being silently overridden.
+  var order = ['auto', 'light', 'dark'];
+  var label = { auto: 'Theme: auto', light: 'Theme: light', dark: 'Theme: dark' };
+  var btn = document.getElementById('theme-toggle');
+  var cur = 'auto';
+  try { cur = localStorage.getItem('fr-theme') || 'auto'; } catch (e) { cur = 'auto'; }
+  function apply(mode) {
+    cur = mode;
+    if (mode === 'auto') delete document.documentElement.dataset.theme;
+    else document.documentElement.dataset.theme = mode;
+    btn.textContent = label[mode];
+    try { localStorage.setItem('fr-theme', mode); } catch (e) { /* private mode */ }
+  }
+  apply(order.indexOf(cur) === -1 ? 'auto' : cur);
+  btn.addEventListener('click', function () {
+    apply(order[(order.indexOf(cur) + 1) % order.length]);
+  });
+})();
+</script>
+"""
+
+
+def payment_method_breakdown(
+    dataset: dict[str, Any], currency: str, month: str
+) -> dict[str, Any]:
+    """Split one month's expenses by the instrument the money left from.
+
+    "Instrument", not "institution": a credit card and a bank account are
+    different kinds of thing even though both arrive here as a key in
+    `dataset["transactions"]`. A card's purchases are debt drawn down and
+    settled later; a bank debit leaves the account immediately. Telling them
+    apart is what makes "what did I actually put on the card" answerable.
+
+    Card pseudo-institutions are identified by *absence* from
+    `dataset["accounts"]` — only real linked bank accounts appear there — so
+    this needs no hardcoded card name.
+    """
+    methods: dict[str, dict[str, Any]] = {}
+    by_category: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+
+    for institution, rows in dataset["transactions"].items():
+        is_card = institution not in dataset["accounts"]
+        for row in rows:
+            if row["currency"] != currency or row["direction"] != "DBIT":
+                continue
+            if row["category"] in NON_SPEND_CATEGORIES:
+                continue
+            if month_key(row["date"]) != month:
+                continue
+            entry = methods.setdefault(
+                institution,
+                {
+                    "label": institution.upper(),
+                    "kind": "credit_card" if is_card else "bank_account",
+                    "total": 0.0,
+                    "count": 0,
+                },
+            )
+            entry["total"] += row["amount"]
+            entry["count"] += 1
+            by_category[row["category"]][institution] += row["amount"]
+
+    grand_total = sum(entry["total"] for entry in methods.values())
+    for entry in methods.values():
+        entry["total"] = round(entry["total"], 2)
+        entry["share_pct"] = (
+            round(entry["total"] / grand_total * 100, 1) if grand_total else 0.0
+        )
+
+    return {
+        "month": month,
+        "currency": currency,
+        "total": round(grand_total, 2),
+        "by_kind": {
+            kind: round(
+                sum(e["total"] for e in methods.values() if e["kind"] == kind), 2
+            )
+            for kind in ("bank_account", "credit_card")
+        },
+        "methods": dict(sorted(methods.items(), key=lambda kv: -kv[1]["total"])),
+        "by_category": {
+            category: {k: round(v, 2) for k, v in sorted(split.items(), key=lambda kv: -kv[1])}
+            for category, split in sorted(
+                by_category.items(), key=lambda kv: -sum(kv[1].values())
+            )
+        },
+    }
+
+
 def build_signals(monthly: dict[str, Any]) -> list[dict[str, Any]]:
     """Rule-based month-over-month flags: stopped, new, or >15% moved categories."""
     months = sorted(monthly)
@@ -694,6 +961,14 @@ _CSS = """
   --series-net-pos:#2a78d6; --series-net-neg:#e34948;
   --status-good:#0ca30c; --status-warning:#fab219;
   --status-serious:#ec835a; --good-text:#006300;
+  /* bank-vs-card identity: categorical slots 7 (violet) + 3 (aqua),
+     validated in both modes. Deliberately NOT the income/expense pair —
+     both of these ARE expenses, so expense-orange would misread as a
+     different measure. Aqua is under 3:1 on the light surface, so the
+     relief rule applies: this chart always ships visible value labels
+     and a table view. */
+  --series-bank:#4a3aa7; --series-card:#1baf7a;
+  --on-bank:#ffffff; --on-card:#0b0b0b;
 }
 @media (prefers-color-scheme: dark) {
   :root:where(:not([data-theme="light"])) .viz-root {
@@ -703,6 +978,8 @@ _CSS = """
     --baseline:#383835; --border:rgba(255,255,255,0.10);
     --series-income:#3987e5; --series-expense:#d95926;
     --series-net-pos:#3987e5; --series-net-neg:#e66767;
+    --series-bank:#9085e9; --series-card:#199e70;
+    --on-bank:#0b0b0b; --on-card:#0b0b0b;
     --good-text:#0ca30c;
   }
 }
@@ -713,14 +990,20 @@ _CSS = """
   --baseline:#383835; --border:rgba(255,255,255,0.10);
   --series-income:#3987e5; --series-expense:#d95926;
   --series-net-pos:#3987e5; --series-net-neg:#e66767;
+  --series-bank:#9085e9; --series-card:#199e70;
+  --on-bank:#0b0b0b; --on-card:#0b0b0b;
   --good-text:#0ca30c;
 }
 * { box-sizing: border-box; }
 body {
-  margin:0; background:var(--page); color:var(--text-primary);
+  margin:0;
   font-family: system-ui,-apple-system,"Segoe UI",sans-serif;
   -webkit-print-color-adjust:exact; print-color-adjust:exact;
 }
+/* The theme tokens are declared on .viz-root, so the page background has to
+   be painted there too — body is its parent and custom properties only
+   inherit downward, which left a white page behind dark cards. */
+.viz-root { background:var(--page); color:var(--text-primary); min-height:100vh; }
 .wrap { max-width:980px; margin:0 auto; padding:32px 20px 64px; }
 header.report-head { margin-bottom:28px; }
 header.report-head h1 { font-size:26px; margin:0 0 4px; }
@@ -731,35 +1014,109 @@ header.report-head p { margin:0; color:var(--text-secondary); font-size:14px; }
 }
 .card h2 { font-size:15px; margin:0 0 4px; }
 .card h3 { font-size:13px; margin:14px 0 4px; color:var(--text-muted); font-weight:600; }
+.methodbar { display:flex; height:22px; border-radius:5px; margin:10px 0 6px; gap:2px; }
+.methodbar-fill:first-child { border-radius:5px 0 0 5px; }
+.methodbar-fill:last-child { border-radius:0 5px 5px 0; }
+.methodbar-fill { display:flex; align-items:center; justify-content:center;
+  font-size:11px; font-weight:600; min-width:0; cursor:default; }
+.methodbar-fill.pm-bank { color:var(--on-bank); }
+.methodbar-fill.pm-card { color:var(--on-card); }
+.methodbar-fill.pm-bank { background:var(--series-bank); }
+.methodbar-fill.pm-card { background:var(--series-card); }
+.methodlegend { display:flex; gap:16px; font-size:11.5px; color:var(--text-muted);
+  margin-bottom:10px; flex-wrap:wrap; }
+.methodlegend .sw { display:inline-block; width:9px; height:9px; border-radius:2px;
+  margin-right:5px; }
+.methodlegend .sw.pm-bank { background:var(--series-bank); }
+.methodlegend .sw.pm-card { background:var(--series-card); }
+
+/* ---- interaction layer ---- */
+#tip {
+  position:fixed; z-index:50; pointer-events:none; opacity:0;
+  transition:opacity .09s ease; max-width:260px;
+  background:var(--surface-1); color:var(--text-primary);
+  border:1px solid var(--border); border-radius:7px;
+  box-shadow:0 6px 20px rgba(0,0,0,.14); padding:8px 10px;
+  font-size:12px; line-height:1.45;
+}
+#tip .tip-v { font-weight:650; font-size:13.5px; font-variant-numeric:tabular-nums; }
+#tip .tip-k { color:var(--text-secondary); }
+/* The hit target is bigger than the mark: this pseudo-element pads every
+   hoverable mark out to a comfortable target without moving the paint. */
+[data-tip] { position:relative; }
+[data-tip]::after {
+  content:""; position:absolute; inset:-7px; border-radius:6px;
+}
+[data-tip]:hover, [data-tip]:focus-visible { filter:brightness(1.12); }
+[data-tip]:focus-visible { outline:2px solid var(--text-primary); outline-offset:2px; }
+tr[data-tip]:hover { background:var(--grid); filter:none; }
+.card-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+.viewtoggle { display:flex; gap:0; flex-shrink:0; }
+.viewtoggle button {
+  font:inherit; font-size:11.5px; padding:3px 9px; cursor:pointer;
+  background:var(--surface-1); color:var(--text-secondary);
+  border:1px solid var(--border); margin-left:-1px;
+}
+.viewtoggle button:first-child { border-radius:5px 0 0 5px; margin-left:0; }
+.viewtoggle button:last-child { border-radius:0 5px 5px 0; }
+.viewtoggle button[aria-pressed="true"] {
+  background:var(--text-primary); color:var(--surface-1);
+  border-color:var(--text-primary); position:relative; z-index:1;
+}
+.themetoggle {
+  font:inherit; font-size:11.5px; padding:4px 10px; cursor:pointer;
+  background:var(--surface-1); color:var(--text-secondary);
+  border:1px solid var(--border); border-radius:5px;
+}
+[hidden] { display:none !important; }
+.showmore {
+  font:inherit; font-size:11.5px; margin-top:6px; padding:5px 11px;
+  cursor:pointer; background:var(--surface-1); color:var(--text-secondary);
+  border:1px solid var(--border); border-radius:5px;
+}
+.showmore:hover { color:var(--text-primary); }
 .card .sub { color:var(--text-secondary); font-size:12.5px; margin:0 0 18px; }
 .kpi-row {
-  display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr));
+  display:grid; grid-template-columns:repeat(auto-fit, minmax(172px, 1fr));
   gap:14px; margin-bottom:20px;
 }
 .kpi {
   background:var(--surface-1); border:1px solid var(--border);
   border-radius:12px; padding:16px 18px;
 }
-.kpi .label { font-size:12px; color:var(--text-secondary); margin-bottom:8px; }
-.kpi .value { font-size:26px; font-weight:600; }
+.kpi .label { font-size:12px; color:var(--text-secondary); margin-bottom:8px;
+  line-height:1.35; }
+/* Proportional figures (not tabular) on a display-size number, and nowrap so
+   a value never breaks across lines inside its tile. */
+.kpi .value { font-size:25px; font-weight:600; white-space:nowrap;
+  font-variant-numeric:proportional-nums; letter-spacing:-0.01em; }
+.kpi .value .unit { font-size:13px; font-weight:500; color:var(--text-secondary);
+  margin-left:3px; }
 .kpi .delta { font-size:12.5px; margin-top:6px; color:var(--text-secondary); }
 .gbar-chart {
-  display:flex; align-items:flex-end; gap:36px; height:220px; padding:0 8px;
+  display:flex; align-items:flex-end; gap:36px; height:230px;
+  padding:0 8px 0 62px;
   border-bottom:1px solid var(--baseline); position:relative;
 }
-.gbar-chart .grid-line { position:absolute; left:0; right:0; height:1px; background:var(--grid); }
+/* Solid hairline ticks, one step off the surface — never dashed. */
+.ytick { position:absolute; left:62px; right:0; height:1px; background:var(--grid); }
+.ytick span {
+  position:absolute; right:100%; top:-0.62em; margin-right:8px;
+  font-size:11px; color:var(--text-muted); font-variant-numeric:tabular-nums;
+  white-space:nowrap;
+}
 .gbar-group {
   display:flex; align-items:flex-end; gap:6px; flex:1;
   justify-content:center; height:100%; position:relative; z-index:1;
 }
-.gbar { width:34px; border-radius:4px 4px 0 0; position:relative; }
+.gbar { width:22px; border-radius:4px 4px 0 0; position:relative; cursor:default; }
 .gbar .val {
   position:absolute; top:-18px; left:50%; transform:translateX(-50%);
   font-size:11px; color:var(--text-secondary); white-space:nowrap;
 }
 .gbar.income { background:var(--series-income); }
 .gbar.expense { background:var(--series-expense); }
-.gbar-labels { display:flex; gap:36px; padding:8px 8px 0; }
+.gbar-labels { display:flex; gap:36px; padding:8px 8px 0 62px; }
 .gbar-labels > div { flex:1; text-align:center; font-size:12.5px; color:var(--text-secondary); }
 .legend-row {
   display:flex; gap:18px; margin-top:14px; font-size:12.5px; color:var(--text-secondary);
@@ -779,12 +1136,14 @@ header.report-head p { margin:0; color:var(--text-secondary); font-size:14px; }
 .divbar-fill.pos { left:50%; background:var(--series-net-pos); }
 .divbar-fill.neg { right:50%; background:var(--series-net-neg); }
 .divbar-val { width:100px; text-align:right; font-size:12.5px; flex-shrink:0; }
-.divbar-val.neg { color:var(--series-net-neg); }
-.divbar-val.pos { color:var(--good-text); }
+/* Text wears text tokens, never the series colour — the coloured bar beside
+   it carries the identity, and the explicit sign carries the direction. */
+.divbar-val { color:var(--text-primary); font-variant-numeric:tabular-nums; }
 .hbar-row { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
 .hbar-label { width:150px; font-size:12.5px; color:var(--text-secondary); flex-shrink:0; }
 .hbar-track { flex:1; height:18px; background:var(--grid); border-radius:3px; overflow:hidden; }
-.hbar-fill { height:100%; background:var(--series-income); border-radius:3px 0 0 3px; }
+.hbar-fill { height:100%; background:var(--series-expense); border-radius:3px 0 0 3px; }
+.hbar-fill.income { background:var(--series-income); }
 .hbar-val { width:130px; text-align:right; font-size:12.5px; flex-shrink:0; }
 .hbar-pct { color:var(--text-muted); font-size:11.5px; margin-left:4px; }
 table { width:100%; border-collapse:collapse; font-size:13px; }
@@ -828,6 +1187,7 @@ def render_html(
     forecast_model: dict[str, Any] | None = None,
     loan_rows: list[dict[str, Any]] | None = None,
     card_info: dict[str, Any] | None = None,
+    methods: dict[str, Any] | None = None,
 ) -> str:
     months = sorted(monthly.get(currency, {}))
     if not months:
@@ -846,20 +1206,32 @@ def render_html(
             loan_by_type[row["loan_type"].strip().lower()].append(row)
 
     max_flow = max(max(m["income"], m["true_expense"]) for m in monthly[currency].values()) or 1
+    # Direct labels stay sparing: past six columns the caps collide, so the
+    # axis + tooltip + table view carry the numbers instead.
+    # Per-bar cap labels collided (two ~45px numbers over a ~50px pair), so
+    # the values move to a real y-axis plus the tooltip and the table view —
+    # direct labels only work while they stay sparing.
+    axis_top = _nice_ceiling(max_flow)
     gbar_groups = []
     for m in months:
         d = monthly[currency][m]
-        income_h, expense_h = d["income"] / max_flow * 100, d["true_expense"] / max_flow * 100
-        gbar_groups.append(f"""
-      <div class="gbar-group">
-        <div class="gbar income" style="height:{income_h:.1f}%">
-          <span class="val">{d['income']:,.0f}</span>
-        </div>
-        <div class="gbar expense" style="height:{expense_h:.1f}%">
-          <span class="val">{d['true_expense']:,.0f}</span>
-        </div>
-      </div>""")
+        bars = ""
+        for cls, name, amount in (
+            ("income", "Income", d["income"]),
+            ("expense", "Expenses", d["true_expense"]),
+        ):
+            height = amount / axis_top * 100
+            bars += (
+                f'<div class="gbar {cls}" style="height:{height:.1f}%" tabindex="0"'
+                f' data-tip="{amount:,.0f} {currency}\n{name} &middot; {m}"></div>'
+            )
+        gbar_groups.append(f'<div class="gbar-group">{bars}</div>')
     gbar_labels = "".join(f"<div>{m}</div>" for m in months)
+    gbar_ticks = "".join(
+        f'<div class="ytick" style="bottom:{frac * 100:.1f}%">'
+        f'<span>{axis_top * frac:,.0f}</span></div>'
+        for frac in (0, 0.25, 0.5, 0.75, 1.0)
+    )
 
     max_abs_net = max(abs(monthly[currency][m]["net"]) for m in months) or 1
     divbar_rows = []
@@ -868,30 +1240,43 @@ def render_html(
         cls, width = ("pos", net) if net >= 0 else ("neg", -net)
         width_pct = width / max_abs_net * 100
         sign = "+" if net >= 0 else "−"
+        d = monthly[currency][m]
         divbar_rows.append(f"""
     <div class="divbar-row">
       <div class="m-label">{m}</div>
-      <div class="divbar-track">
+      <div class="divbar-track" tabindex="0"
+           data-tip="{sign}{abs(net):,.0f} {currency}\nNet &middot; {m}\nIncome {d['income']:,.0f} &minus; expenses {d['true_expense']:,.0f}">
         <div class="divbar-mid"></div>
         <div class="divbar-fill {cls}" style="width:{width_pct:.1f}%"></div>
       </div>
-      <div class="divbar-val {cls}">{sign}{abs(net):,.0f}</div>
+      <div class="divbar-val">{sign}{abs(net):,.0f}</div>
     </div>""")
 
     cats = sorted(focus_data["category_breakdown"].items(), key=lambda kv: -kv[1])
     max_cat = cats[0][1] if cats else 1
     total_expense = focus_data["true_expense"] or 1
     hbar_rows = []
-    for cat, amt in cats:
+    _TOP_N = 10
+    for index, (cat, amt) in enumerate(cats):
         label = CATEGORY_LABELS.get(cat, cat)
+        extra = ' class="hbar-row tail" hidden' if index >= _TOP_N else ' class="hbar-row"'
         width_pct = amt / max_cat * 100
         pct_of_total = amt / total_expense * 100
         hbar_rows.append(f"""
-    <div class="hbar-row">
+    <div{extra}>
       <div class="hbar-label">{label}</div>
-      <div class="hbar-track"><div class="hbar-fill" style="width:{width_pct:.1f}%"></div></div>
+      <div class="hbar-track" tabindex="0"
+           data-tip="{amt:,.0f} {currency}\n{label}\n{pct_of_total:.1f}% of {focus} expenses">
+        <div class="hbar-fill" style="width:{width_pct:.1f}%"></div></div>
       <div class="hbar-val">{amt:,.0f} <span class="hbar-pct">{pct_of_total:.0f}%</span></div>
     </div>""")
+    if len(cats) > _TOP_N:
+        hbar_rows.append(
+            f'<button type="button" class="showmore" id="cat-more" '
+            f'data-more="Show all {len(cats)} categories" '
+            f'data-less="Show top {_TOP_N} only">'
+            f'Show all {len(cats)} categories</button>'
+        )
 
     income_cats = sorted(focus_data["income_breakdown"].items(), key=lambda kv: -kv[1])
     max_income_cat = income_cats[0][1] if income_cats else 1
@@ -904,13 +1289,77 @@ def render_html(
         income_hbar_rows.append(f"""
     <div class="hbar-row">
       <div class="hbar-label">{label}</div>
-      <div class="hbar-track"><div class="hbar-fill" style="width:{width_pct:.1f}%"></div></div>
+      <div class="hbar-track" tabindex="0"
+           data-tip="{amt:,.0f} {currency}\n{label}\n{pct_of_total:.1f}% of {focus} income">
+        <div class="hbar-fill income" style="width:{width_pct:.1f}%"></div></div>
       <div class="hbar-val">{amt:,.0f} <span class="hbar-pct">{pct_of_total:.0f}%</span></div>
     </div>""")
     income_hbar_html = "".join(income_hbar_rows) if income_hbar_rows else (
         '<p style="font-size:12.5px;color:var(--text-secondary)">'
         "No categorized income this period.</p>"
     )
+
+    # A one-column column chart and a one-row diverging bar are both the
+    # "one-bar bar chart" anti-pattern: the form promises a comparison the
+    # data cannot make, which is exactly what makes a single-month report
+    # look broken. With one month the honest form is the figures themselves,
+    # plus a pointer to how to get the trend.
+    institutions_label = " & ".join(i.upper() for i in dataset["institutions"])
+
+    trend_table = (
+        "<table><tr><th>Month</th><th class='num'>Income</th>"
+        "<th class='num'>Expenses</th><th class='num'>Net</th></tr>"
+        + "".join(
+            "<tr>"
+            f"<td>{m}</td>"
+            f"<td class='num'>{monthly[currency][m]['income']:,.0f}</td>"
+            f"<td class='num'>{monthly[currency][m]['true_expense']:,.0f}</td>"
+            f"<td class='num'>{monthly[currency][m]['net']:+,.0f}</td>"
+            "</tr>"
+            for m in months
+        )
+        + "</table>"
+    )
+
+    if len(months) == 1:
+        # The KPI row above already carries this month's figures, so repeating
+        # them here would just be the same four numbers twice. All that is
+        # missing is why there are no trend charts.
+        trend_html = f"""
+  <div class="card">
+    <h2>No trend charts for a single month</h2>
+    <p class="sub">
+      Only {months[0]} is in range. A one-column chart would imply a
+      comparison this data can't make, so the figures above stand on their
+      own. Re-run across several months to get the trend and
+      month-over-month signals &mdash; for example
+      <code>--from {months[0][:4]}-07-01 --to {months[0]}-30</code>.
+    </p>
+  </div>"""
+    else:
+        trend_chart = f"""
+    <div class="gbar-chart">
+      {gbar_ticks}
+      {''.join(gbar_groups)}
+    </div>
+    <div class="gbar-labels">{gbar_labels}</div>
+    <div class="legend-row">
+      <span><span class="sw" style="background:var(--series-income)"></span>Income</span>
+      <span><span class="sw" style="background:var(--series-expense)"></span>Expenses (true)</span>
+    </div>"""
+        trend_html = _card_with_table(
+            "Income vs. expenses by month",
+            f"{institutions_label}, {currency}",
+            trend_chart,
+            trend_table,
+            "trend",
+        ) + _card_with_table(
+            "Net cash flow by month",
+            "Income minus true expenses",
+            "".join(divbar_rows),
+            trend_table,
+            "net",
+        )
 
     all_cats = sorted({c for m in months for c in monthly[currency][m]["category_breakdown"]})
     table_header = "".join(f"<th class='num'>{m}</th>" for m in months)
@@ -965,10 +1414,7 @@ def render_html(
         pct = (focus_data["income"] - prev_data["income"]) / prev_data["income"] * 100
         prev_income_delta = f"{'↑' if pct >= 0 else '↓'} {abs(pct):.0f}% vs {months[-2]}"
 
-    institutions_label = " & ".join(i.upper() for i in dataset["institutions"])
-    net_color = "var(--good-text)" if focus_data["net"] >= 0 else "var(--series-net-neg)"
     net_sign = "+" if focus_data["net"] >= 0 else "−"
-    savings_color = "var(--good-text)" if savings_rate >= 0 else "var(--series-net-neg)"
     hbar_html = "".join(hbar_rows) if hbar_rows else (
         '<p style="font-size:12.5px;color:var(--text-secondary)">'
         "No categorized expenses this period.</p>"
@@ -979,7 +1425,7 @@ def render_html(
         balance_kpi = f"""
     <div class="kpi">
       <div class="label">Balance in hand (now)</div>
-      <div class="value">{balance_total:,.0f} {currency}</div>
+      <div class="value">{balance_total:,.0f}<span class="unit">{currency}</span></div>
       <div class="delta">Current (within {BALANCE_CACHE_TTL_MINUTES}min), not from the {focus} snapshot</div>
     </div>"""
     balance_note = ""
@@ -997,7 +1443,6 @@ def render_html(
         predicted_income = income_pred.get("predicted_next", 0.0)
         predicted_expense = predicted_expense_total(forecast_model)
         predicted_net = round(predicted_income - predicted_expense, 2)
-        pred_net_color = "var(--good-text)" if predicted_net >= 0 else "var(--series-net-neg)"
         pred_net_sign = "+" if predicted_net >= 0 else "−"
 
         method_notes = {
@@ -1046,23 +1491,101 @@ def render_html(
     <div class="kpi-row" style="grid-template-columns:repeat(3,1fr);">
       <div class="kpi">
         <div class="label">Predicted income</div>
-        <div class="value">{predicted_income:,.0f} {currency}</div>
+        <div class="value">{predicted_income:,.0f}<span class="unit">{currency}</span></div>
         <div class="delta">{income_note}</div>
       </div>
       <div class="kpi">
         <div class="label">Predicted expenses</div>
-        <div class="value">{predicted_expense:,.0f} {currency}</div>
+        <div class="value">{predicted_expense:,.0f}<span class="unit">{currency}</span></div>
       </div>
       <div class="kpi">
         <div class="label">Predicted net</div>
-        <div class="value" style="color:{pred_net_color}">
-          {pred_net_sign}{abs(predicted_net):,.0f} {currency}
-        </div>
+        <div class="value">{pred_net_sign}{abs(predicted_net):,.0f}<span
+          class="unit">{currency}</span></div>
       </div>
     </div>
     <table>
       <tr><th>Category</th><th class="num">Predicted</th><th>Basis</th></tr>
       {''.join(cat_rows)}
+    </table>
+  </div>"""
+
+    methods_html = ""
+    if methods and methods["total"]:
+        bank_total = methods["by_kind"]["bank_account"]
+        card_total = methods["by_kind"]["credit_card"]
+        total = methods["total"]
+        kind_label = {"bank_account": "Bank account", "credit_card": "Credit card"}
+
+        method_rows = "".join(
+            "<tr>"
+            f"<td>{html.escape(entry['label'])}</td>"
+            f"<td>{kind_label[entry['kind']]}</td>"
+            f"<td class='num'>{entry['total']:,.0f} {currency}</td>"
+            f"<td class='num'>{entry['share_pct']:.1f}%</td>"
+            f"<td class='num'>{entry['count']}</td>"
+            "</tr>"
+            for entry in methods["methods"].values()
+        )
+
+        instruments = list(methods["methods"])
+        matrix_head = "".join(
+            f"<th class='num'>{html.escape(name.upper())}</th>" for name in instruments
+        )
+        matrix_rows = ""
+        for category, split in methods["by_category"].items():
+            cells = "".join(
+                f"<td class='num'>{split.get(name, 0):,.0f}</td>" if split.get(name) else "<td class='num'>—</td>"
+                for name in instruments
+            )
+            matrix_rows += (
+                "<tr>"
+                f"<td>{html.escape(CATEGORY_LABELS.get(category, category))}</td>"
+                f"{cells}"
+                f"<td class='num'><strong>{sum(split.values()):,.0f}</strong></td>"
+                "</tr>"
+            )
+
+        bank_pct = bank_total / total * 100 if total else 0
+        card_pct = card_total / total * 100 if total else 0
+        # An in-segment label is only drawn when it actually fits. Below this
+        # the text would be cropped by its own mark, which reads worse than no
+        # label — the value stays in the legend, the tooltip and the table.
+        bank_label = f"{bank_pct:.0f}%" if bank_pct >= 12 else ""
+        card_label = f"{card_pct:.0f}%" if card_pct >= 12 else ""
+        methods_html = f"""
+  <div class="card">
+    <h2>How you paid &mdash; {methods['month']}</h2>
+    <p class="sub">
+      Which instrument each expense actually left from. A card purchase is
+      debt drawn down and settled later; a bank debit leaves the account
+      immediately &mdash; so this is a different question from the category
+      breakdown above, not a restatement of it. The monthly card bill
+      itself is excluded, since the purchases it settles are already counted.
+    </p>
+    <div class="methodbar">
+      <div class="methodbar-fill pm-bank" style="width:{bank_pct:.1f}%" tabindex="0"
+           data-tip="{bank_total:,.0f} {currency}\nBank accounts &middot; {bank_pct:.1f}% of expenses"
+           >{bank_label}</div>
+      <div class="methodbar-fill pm-card" style="width:{card_pct:.1f}%" tabindex="0"
+           data-tip="{card_total:,.0f} {currency}\nCredit card &middot; {card_pct:.1f}% of expenses"
+           >{card_label}</div>
+    </div>
+    <div class="methodlegend">
+      <span><i class="sw pm-bank"></i>Bank accounts {bank_total:,.0f} {currency}</span>
+      <span><i class="sw pm-card"></i>Credit card {card_total:,.0f} {currency}</span>
+    </div>
+    <table>
+      <tr>
+        <th>Source</th><th>Type</th><th class="num">Spent</th>
+        <th class="num">Share</th><th class="num">Txns</th>
+      </tr>
+      {method_rows}
+    </table>
+    <h3>Category &times; source</h3>
+    <table>
+      <tr><th>Category</th>{matrix_head}<th class="num">Total</th></tr>
+      {matrix_rows}
     </table>
   </div>"""
 
@@ -1249,30 +1772,34 @@ def render_html(
 <div class="viz-root">
 <div class="wrap">
   <header class="report-head">
-    <h1>Financial Report — {focus}</h1>
-    <p>Accounts: {institutions_label} &middot; Currency: {currency} &middot;
-       Generated {dataset['generated_at']} from live Enable Banking data</p>
+    <div class="card-head">
+      <div>
+        <h1>Financial Report — {focus}</h1>
+        <p>Accounts: {institutions_label} &middot; Currency: {currency} &middot;
+           Generated {dataset['generated_at']} from live Enable Banking data</p>
+      </div>
+      <button type="button" id="theme-toggle" class="themetoggle">Theme: auto</button>
+    </div>
   </header>
 
   <div class="kpi-row">
     <div class="kpi">
-      <div class="label">Income ({focus})</div>
-      <div class="value">{focus_data['income']:,.0f} {currency}</div>
+      <div class="label">Income</div>
+      <div class="value">{focus_data['income']:,.0f}<span class="unit">{currency}</span></div>
       <div class="delta">{prev_income_delta}</div>
     </div>
     <div class="kpi">
-      <div class="label">True expenses ({focus})</div>
-      <div class="value">{focus_data['true_expense']:,.0f} {currency}</div>
+      <div class="label">True expenses</div>
+      <div class="value">{focus_data['true_expense']:,.0f}<span class="unit">{currency}</span></div>
     </div>
     <div class="kpi">
       <div class="label">Net cash flow</div>
-      <div class="value" style="color:{net_color}">
-        {net_sign}{abs(focus_data['net']):,.0f} {currency}
-      </div>
+      <div class="value">{net_sign}{abs(focus_data['net']):,.0f}<span
+        class="unit">{currency}</span></div>
     </div>
     <div class="kpi">
       <div class="label">Savings rate</div>
-      <div class="value" style="color:{savings_color}">{savings_rate:+.1f}%</div>
+      <div class="value">{savings_rate:+.1f}%</div>
     </div>{balance_kpi}
   </div>
   <p style="font-size:11.5px;color:var(--text-muted);margin:-6px 0 20px;">
@@ -1280,28 +1807,7 @@ def render_html(
     (category: internal_transfer) — those are moves, not income or spend.
     {card_footnote}
   </p>{balance_note}
-
-  <div class="card">
-    <h2>Income vs. expenses by month</h2>
-    <p class="sub">{institutions_label}, {currency}</p>
-    <div class="gbar-chart">
-      <div class="grid-line" style="bottom:0%"></div>
-      <div class="grid-line" style="bottom:33.3%"></div>
-      <div class="grid-line" style="bottom:66.6%"></div>
-      {''.join(gbar_groups)}
-    </div>
-    <div class="gbar-labels">{gbar_labels}</div>
-    <div class="legend-row">
-      <span><span class="sw" style="background:var(--series-income)"></span>Income</span>
-      <span><span class="sw" style="background:var(--series-expense)"></span>Expenses (true)</span>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2>Net cash flow by month</h2>
-    <p class="sub">Income minus true expenses</p>
-    {''.join(divbar_rows)}
-  </div>
+{trend_html}
 
   <div class="card">
     <h2>Where {focus}'s money went</h2>
@@ -1320,6 +1826,7 @@ def render_html(
     <table><tr><th>Category</th>{table_header}</tr>{''.join(table_rows)}</table>
   </div>
 {forecast_html}
+{methods_html}
 {card_html}
 {loan_html}
 
@@ -1338,6 +1845,8 @@ def render_html(
   </footer>
 </div>
 </div>
+<div id="tip" role="status" aria-live="polite"></div>
+{_SCRIPT}
 </body>
 </html>
 """
@@ -1470,12 +1979,25 @@ def main(argv: list[str] | None = None) -> int:
 
     dataset = _merge_datasets(parts, args.date_from, args.date_to)
 
+    cards_dir_for_people = data_dir / "cards"
+    person_recipients = (
+        load_person_recipients(cards_dir_for_people)
+        if cards_dir_for_people.is_dir()
+        else ()
+    )
+    recategorized = recategorize(dataset, person_recipients)
+    if recategorized:
+        print(
+            f"Recategorized {recategorized} cached transaction(s) under the "
+            "current rules"
+        )
+
     # Credit-card statements are local PDFs, not an API: parsing them costs
     # nothing and never touches the bank quota, so this runs before the
     # summaries so the decomposed categories feed everything downstream
     # (breakdown, signals, forecast) rather than being bolted on at render.
     card_info: dict[str, Any] | None = None
-    cards_dir = data_dir / "cards"
+    cards_dir = cards_dir_for_people
     if not args.skip_cards and statement_pdfs_present(cards_dir):
         statements = load_statements(cards_dir, refresh=args.refresh_cards)
         # Always emit the JSON artifacts, independent of the HTML: the
@@ -1490,7 +2012,7 @@ def main(argv: list[str] | None = None) -> int:
             args.date_from,
             args.date_to,
             args.currency,
-            load_person_recipients(cards_dir),
+            person_recipients,
         )
         if card_info:
             print(
@@ -1524,6 +2046,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
     signals = build_signals(monthly[args.currency])
+    focus_month = sorted(monthly[args.currency])[-1]
+    methods = payment_method_breakdown(dataset, args.currency, focus_month)
     forecast_model = update_and_predict(out_dir, args.currency, monthly[args.currency])
     print(f"Updated forecast model: {out_dir / 'data' / f'forecast_model_{args.currency}.json'}")
 
@@ -1558,7 +2082,8 @@ def main(argv: list[str] | None = None) -> int:
                 "period": {"from": args.date_from, "to": args.date_to},
                 "currency": args.currency,
                 "institutions": dataset["institutions"],
-                "focus_month": sorted(monthly[args.currency])[-1],
+                "focus_month": focus_month,
+                "payment_methods": methods,
                 "monthly": {
                     month: {
                         "income": round(figures["income"], 2),
@@ -1612,6 +2137,7 @@ def main(argv: list[str] | None = None) -> int:
             forecast_model=forecast_model,
             loan_rows=loan_rows,
             card_info=card_info,
+            methods=methods,
         )
     )
     print(f"Wrote report: {report_path}")

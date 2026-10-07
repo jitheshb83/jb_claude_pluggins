@@ -12,6 +12,13 @@ from __future__ import annotations
 
 # (category, [keywords]) -- checked in order, first match wins.
 CATEGORY_RULES: list[tuple[str, list[str]]] = [
+    # Funding a linked account from the user's own credit card ("Top-Up by
+    # *5541"). Must come first and must beat the CRDT income fallback: the
+    # money arriving is a move between the user's own instruments, not
+    # income. The card side already books the outgoing leg as
+    # internal_transfer, so without this the same 500 kr counted as income
+    # here and the eventual purchase counted as spend.
+    ("internal_transfer", ["top-up by *", "top up by *"]),
     ("mortgage", ["betaling på lån", "restgjeld", "avdrag"]),
     ("credit_card", ["entercard"]),
     ("car_finance", ["dnb finans"]),
@@ -38,6 +45,7 @@ def categorize(
     counterparty_name: str | None,
     description: str | None,
     own_names: set[str],
+    person_recipients: tuple[str, ...] | list[str] = (),
 ) -> str:
     """Assign one category label to a transaction.
 
@@ -45,6 +53,12 @@ def categorize(
     being processed together, so a transfer between two of the user's own
     accounts is recognized as internal_transfer regardless of which
     institution's counterparty field it shows up in.
+
+    person_recipients: the same private-person list `categorize_card` uses
+    (from local user data). Applied here too so paying a given person is
+    categorized the same way whether it went out on the card or straight
+    from a bank account, rather than landing in `uncategorized` on one side
+    only.
     """
     name = (counterparty_name or "").strip().lower()
     if name and name in own_names:
@@ -55,6 +69,9 @@ def categorize(
     for category, keywords in CATEGORY_RULES:
         if any(keyword in haystack for keyword in keywords):
             return category
+
+    if person_recipients and any(p in haystack for p in person_recipients):
+        return "person_transfer"
 
     if direction == "CRDT":
         if any(employer in haystack for employer in SALARY_EMPLOYERS):
