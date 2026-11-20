@@ -55,6 +55,10 @@ Return a markdown section, ready to paste into review.md:
 - A findings table with columns `# | important / nit | file:line | finding | concrete failure scenario`.
   Ranks findings most-severe first. Only report what you verified in the code;
   label uncertain items `(unverified)`.
+- Tag every finding `bug`, `false-positive?` or `out-of-scope` (deliberate
+  evasion of the guardrails, outside the threat model).
+- Report **all** findings in this one pass. Don't hold any back for a later
+  round.
 - One line: `Recommended verdict: PASS` or `FAIL`, with the reason.
 
 If you find nothing, say so plainly rather than inventing nits. Return only

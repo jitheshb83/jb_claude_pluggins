@@ -11,6 +11,22 @@ Goal: agree on **what** and **why** before anyone decides how. The output is
 features skip this phase, because their acceptance criteria live in
 `plan.md`.
 
+## Read-only planning (native plan mode)
+
+Planning runs read-only. Writing code before approval is what the gates
+exist to prevent, so use Claude Code's own mechanism first:
+
+1. Run `sdlc.py new` (or `status`) **before** entering plan mode. Plan
+   mode refuses writes.
+2. If the `EnterPlanMode` tool is available (interactive sessions), call
+   it. Scouts (read-only), file reads and `AskUserQuestion` all work inside
+   plan mode.
+3. Present the finished artifact with `ExitPlanMode`. The user's approval
+   there is the approval. Then write the file from exactly that text and
+   record it with `approve spec --note "approved in plan mode: <their words>"`.
+4. If `EnterPlanMode` isn't available (headless or `-p` runs), use the
+   `AskUserQuestion` approval described below.
+
 ## Steps
 
 1. **Ground yourself cheaply.** Read the repo's CLAUDE.md and README. To

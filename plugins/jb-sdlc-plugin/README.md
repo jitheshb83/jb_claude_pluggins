@@ -42,7 +42,7 @@ flowchart LR
 | `hooks/session.py` | SessionStart | Routes this session's git through `githooks/` (via `CLAUDE_ENV_FILE`; no repo or global config changes). |
 | `githooks/` | git hooks | `pre-push` refuses any push from a Claude session. `pre-commit` runs the fresh-branch check and refuses code commits before plan approval. `pre-merge-commit` refuses merges into the base, and `reference-transaction` refuses moving `main`/`master` anywhere except to `origin/<base>`, so `git pull` still works. All of them hand off to the repo's own hooks. |
 | `hooks/drift.py` | PostToolUse (Bash) | Checks results, not command text: reports code files changed since the feature started while the plan is unapproved. |
-| `hooks/gate.py` | PreToolUse | Blocks every `git push`, `gh pr create` and `gh pr merge`, and merges into the base. Blocks commits on main or merged branches, and edits to `state.json`. Blocks code changes before the plan is approved, whether made with the Edit/Write tools or through the shell. |
+| `hooks/gate.py` | PreToolUse | Thin early warning, about 200 lines of patterns rather than a shell parser. Edit/Write to code before plan approval and to `state.json` are refused. In Bash it refuses `git push`, `gh pr create/merge`, `gh api` writes to PRs, switching the hooks off (`--no-verify`, `core.hooksPath`, `CLAUDECODE`/`SDLC_*`/`GIT_CONFIG_*`), and `git commit` on a stale branch or before approval. |
 | `scripts/sdlc.py` | stdlib CLI | `new`, `track`, `status`, `approve`, `reopen`, `revert-drift`, `abandon`, `check-diagrams`, `check-branch`. |
 | `references/diagrams.md` | — | Mermaid house style (muted, semantic palette that works in light and dark themes) and templates: user flow, change map, sequence, lanes, state, ER. |
 
@@ -159,6 +159,9 @@ stale branch, or code written before you approved the plan. They don't
 protect against a determined adversary; any process with shell access can
 undo local controls. Enforcement works in layers, strongest first:
 
+0. **Planning in native plan mode** (interactive sessions). It's read-only,
+   and leaving it needs your approval through `ExitPlanMode`. In headless
+   runs the `AskUserQuestion` approval is used instead.
 1. **Git hooks (`githooks/`).** Git runs these however a command is spelled:
    aliases, absolute paths, wrappers, `bash -c`, heredocs, `eval`. They're
    active only while `CLAUDECODE=1` is set, so your own terminal is
@@ -170,10 +173,14 @@ undo local controls. Enforcement works in layers, strongest first:
    `sdlc.py revert-drift <paths>`, which only touches reported files. It
    asks you before reverting anything that could be your own edit. The
    pre-commit hook won't commit such changes either way.
-3. **Text gate (`gate.py`).** An early warning before a command runs.
-   It's thorough but not complete by design. On an internal error it
-   blocks git/gh commands and allows everything else.
-4. **State integrity.** If `state.json` is unreadable, or the feature folder
+3. **Early warning (`gate.py`).** A few patterns checked before a command
+   runs. They give a clear message before git or drift would catch the
+   same thing. Shell writes aren't parsed at all; layers 1, 2 and 4 cover
+   them by checking results. On an internal error it blocks git/gh commands
+   and allows everything else.
+4. **State integrity.** `sdlc.py` records a hash of every `state.json` it
+   writes. A copy changed by anything else, unless it's the committed
+   version, counts as tampered and blocks code. If `state.json` is unreadable, or the feature folder
    has been deleted (whether committed or not, since the git dir keeps a
    registry), code changes are blocked rather than the gates switching off.
    `git clean` and `git stash -u` are refused while the feature docs are
@@ -182,7 +189,9 @@ undo local controls. Enforcement works in layers, strongest first:
 **What the hooks can't check:**
 - whether an approval was really typed by you (the skills require your
   words in `--note`);
-- `gh api` calls the text gate doesn't recognise as publishing.
+- `gh pr create` hidden inside `bash -c` or `$(…)` without one of the patterns
+  (native deny rules also miss those forms, as tested). If the branch
+  isn't pushed yet, `gh` has to push, which the git hook refuses.
 
 ## Install
 

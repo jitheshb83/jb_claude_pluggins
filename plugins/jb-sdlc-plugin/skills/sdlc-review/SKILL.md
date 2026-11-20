@@ -11,6 +11,10 @@ mistakes.
 
 ## Steps
 
+**One pass, then stop.** Reviews report findings in batches unless asked for
+all of them. Chasing batches one at a time turns review into an endless
+loop, so collect the complete list once and triage it once.
+
 Steps 1–3 are independent, so **run them concurrently**. Spawn the reviewer
 agent first (subagents run in the background), then invoke the review skills
 while it works, and collect everything before step 4.
@@ -21,19 +25,28 @@ while it works, and collect everything before step 4.
    as a backend and the Android app, spawn one reviewer per area in the same
    message.
 2. **Correctness, full track only.** Invoke the `code-review` skill on the
-   branch at level `high`. Never use `max` or `ultra` unless the user asks.
+   branch at level `high` with `--max-findings all`, so every finding comes
+   back in one run. Never use `max` or `ultra` unless the user asks.
 3. **Security, when the change touches** auth, tokens, MCP tool exposure,
    input-derived file paths, subprocess calls or network: invoke
    `security-review`, on any track.
-4. Write `review.md` from the template. De-duplicate, and drop false
-   positives you verified, with one line on why.
+4. **Triage every finding once** into one of these:
+   - **bug**: fix it;
+   - **false positive**: drop it, with one line on why;
+   - **out of scope**: deliberate evasion of the guardrails, which the
+     README threat model says the gates don't defend against. Document it
+     under Follow-ups; don't fix it.
+
+   Write `review.md` from the template.
 5. **Important findings are build work, and the fix plan needs approval.**
    List the fixes you intend to make, one line each with its finding number,
    and get the user's yes before anything changes. Then run
    `sdlc.py reopen build --note "review fixes"`, re-spawn `sdlc-builder` with
    the findings list (one builder per lane when the fixes fall in disjoint
    files, run in parallel as in `sdlc-build`), re-record the build evidence, and then re-run only the
-   reviewer agent on the new diff, not the whole review stack.
+   reviewer agent on the new diff, not the whole review stack. **At most two
+   fix rounds.** Anything still open after that goes to the user as a list,
+   not into a third round.
 6. When nothing important remains open, set `Verdict: PASS` and record it:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/sdlc.py" approve review --note "<n> fixed, <m> deferred"

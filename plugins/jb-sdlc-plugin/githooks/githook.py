@@ -30,11 +30,17 @@ def enforce(name: str, root: Path, data: bytes = b"") -> None:
     if name == "pre-push" and not allow_push:
         refuse("the SDLC never pushes. The user pushes from their own terminal, or in Claude Code "
                "with `! SDLC_ALLOW_PUSH=1 git push ...`.")
+    if name == "pre-push":  # even when pushing is allowed: base branches change only via a PR
+        for line in data.decode(errors="replace").splitlines():
+            parts = line.split()
+            if len(parts) == 4 and parts[2].removeprefix("refs/heads/") in sdlc.BASE_BRANCHES:
+                refuse(f"pushing to '{parts[2]}' refused — base branches change only via a PR.")
     branch = sdlc.current_branch(root)
     if name == "pre-merge-commit" and (branch in sdlc.BASE_BRANCHES or branch == sdlc.default_base(root)):
         refuse(f"the SDLC never merges into '{branch}'. The user merges the PR.")
     if name == "reference-transaction":
         bases = sdlc.BASE_BRANCHES | {sdlc.default_base(root)}
+        current = f"refs/heads/{branch}" if branch else None
         for line in data.decode(errors="replace").splitlines():
             parts = line.split()
             if len(parts) != 3 or not parts[2].startswith("refs/heads/"):
@@ -45,6 +51,13 @@ def enforce(name: str, root: Path, data: bytes = b"") -> None:
             if b in bases and parts[1] not in remotes:
                 refuse(f"refusing to move '{b}' to a commit no remote has: the SDLC never changes "
                        f"the base branch, it only fast-forwards it to a remote's {b}.")
+            if parts[2] == current and b not in bases and set(parts[1]) != {"0"}:
+                # Any new commit on the current branch (commit, cherry-pick, revert, am,
+                # merge, rebase): never onto a merged branch. Local evidence only, so it's fast.
+                os.environ["SDLC_NO_GH"] = "1"
+                reason = sdlc.check_branch(root)
+                if reason:
+                    refuse(reason)
     if name in ("pre-commit", "pre-merge-commit"):
         feat = sdlc.active_feature(root)
         reason = sdlc.check_branch(root, (feat or {}).get("base"))

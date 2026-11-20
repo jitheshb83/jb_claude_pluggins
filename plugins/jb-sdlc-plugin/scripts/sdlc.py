@@ -456,12 +456,52 @@ def _valid_state(s) -> bool:
             and isinstance(s.get("approvals", {}), dict))
 
 
+def _hash_record(root: Path) -> Path | None:
+    gd = git(root, "rev-parse", "--git-common-dir")
+    return (root / gd / "sdlc-state-hashes.json") if gd else None
+
+
+def _recorded(root: Path) -> dict:
+    f = _hash_record(root)
+    try:
+        return json.loads(f.read_text()) if f and f.exists() else {}
+    except ValueError:
+        return {}
+
+
+def _record(root: Path, rel: str, digest: str) -> None:
+    f = _hash_record(root)
+    if f:
+        rec = _recorded(root)
+        rec[rel] = digest
+        f.write_text(json.dumps(rec, indent=2))
+
+
+def _tampered(state_file: Path) -> bool:
+    """state.json differs both from what sdlc.py last wrote and from HEAD's copy."""
+    root = repo_root(state_file)
+    if not root:
+        return False
+    rel = str(state_file.relative_to(root))
+    want = _recorded(root).get(rel)
+    have = sha(state_file)
+    if want is None or have == want:
+        return False
+    committed = subprocess.run(["git", "-C", str(root), "show", f"HEAD:{rel}"], capture_output=True)
+    if committed.returncode == 0 and hashlib.sha256(committed.stdout).hexdigest() == have:
+        _record(root, rel, have)  # a legitimate checkout/merge brought the committed copy
+        return False
+    return True
+
+
 def load(state_file: Path) -> dict:
-    """Parse a state.json. Anything unreadable comes back as a *corrupt* state,
-    which blocks code changes instead of silently switching the gate off."""
+    """Parse a state.json. Anything unreadable, or changed outside sdlc.py, comes
+    back as a *corrupt* state, which blocks code changes instead of opening gates."""
     try:
         s = json.loads(state_file.read_text())
     except (OSError, ValueError):
+        s = None
+    if _valid_state(s) and _tampered(state_file):
         s = None
     if not _valid_state(s):
         return {"title": f"unreadable {state_file.parent.name}/state.json", "branch": None,
@@ -473,7 +513,11 @@ def load(state_file: Path) -> dict:
 def save(state: dict) -> None:
     d = state["_dir"]
     data = {k: v for k, v in state.items() if not k.startswith("_")}
-    (d / "state.json").write_text(json.dumps(data, indent=2) + "\n")
+    f = d / "state.json"
+    f.write_text(json.dumps(data, indent=2) + "\n")
+    root = repo_root(d)
+    if root:
+        _record(root, str(f.relative_to(root)), sha(f))
 
 
 def all_features(root: Path) -> list[dict]:
