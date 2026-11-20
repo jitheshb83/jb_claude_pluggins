@@ -360,8 +360,9 @@ def _baseline_file(root: Path, state: dict) -> Path | None:
     return (root / gd / f"sdlc-baseline-{state['_dir'].name}.json") if gd else None
 
 
-def dirty_code(root: Path) -> dict[str, str]:
-    """Changed or untracked files outside docs/sdlc -> content hash ('' if deleted)."""
+def dirty_code(root: Path, store: bool = False) -> dict[str, str]:
+    """Changed or untracked files outside docs/sdlc -> content hash ('' if deleted).
+    store=True also writes the blobs into the object db, for revert-drift."""
     out = {}
     try:  # not via git(): it strips, which would eat the first entry's status column
         status = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "-uall", "-z"],
@@ -380,14 +381,15 @@ def dirty_code(root: Path) -> dict[str, str]:
         if Path(rel).parts[:2] == SDLC_DIR.parts:
             continue
         f = root / rel
-        out[rel] = (git(root, "hash-object", "--", rel) or "") if f.is_file() else ""
+        args = ["hash-object", "-w", "--", rel] if store else ["hash-object", "--", rel]
+        out[rel] = (git(root, *args) or "") if f.is_file() else ""
     return out
 
 
 def save_baseline(root: Path, state: dict, approved: bool = False) -> None:
     bf = _baseline_file(root, state)
     if bf:
-        bf.write_text(json.dumps({"approved": approved, "files": dirty_code(root)}))
+        bf.write_text(json.dumps({"approved": approved, "files": dirty_code(root, store=True)}))
 
 
 def drift(root: Path, state: dict) -> list[str]:
@@ -406,6 +408,15 @@ def drift(root: Path, state: dict) -> list[str]:
         save_baseline(root, state, approved=False)
         return []
     return sorted(p for p, h in dirty_code(root).items() if base["files"].get(p) != h)
+
+
+def baseline_files(root: Path, state: dict) -> dict[str, str]:
+    bf = _baseline_file(root, state)
+    try:
+        base = json.loads(bf.read_text()) if bf and bf.exists() else {}
+    except ValueError:
+        base = {}
+    return base.get("files", base) if isinstance(base, dict) else {}
 
 
 # ------------------------------------------------------------------- state
@@ -453,8 +464,34 @@ def all_features(root: Path) -> list[dict]:
     return [load(f) for f in sorted((root / SDLC_DIR).glob("*/state.json"))]
 
 
+def _registry_file(root: Path) -> Path | None:
+    gd = git(root, "rev-parse", "--git-common-dir")
+    return (root / gd / "sdlc-registry.json") if gd else None
+
+
+def registry(root: Path) -> dict:
+    f = _registry_file(root)
+    try:
+        return json.loads(f.read_text()) if f and f.exists() else {}
+    except ValueError:
+        return {}
+
+
+def set_registry(root: Path, branch: str, rel_dir: str | None) -> None:
+    f = _registry_file(root)
+    if not f:
+        return
+    reg = registry(root)
+    if rel_dir is None:
+        reg.pop(branch, None)
+    else:
+        reg[branch] = rel_dir
+    f.write_text(json.dumps(reg, indent=2))
+
+
 def _deleted_feature(root: Path, branch: str) -> dict | None:
-    """A feature committed on this branch whose folder is gone from the worktree."""
+    """A feature on this branch whose folder is gone from the worktree: found in
+    HEAD, or in the registry `new` keeps in the git dir (for uncommitted folders)."""
     listed = git(root, "ls-tree", "-r", "--name-only", "HEAD", "--", str(SDLC_DIR)) or ""
     for rel in listed.splitlines():
         if not rel.endswith("/state.json") or (root / rel).exists():
@@ -467,6 +504,10 @@ def _deleted_feature(root: Path, branch: str) -> dict | None:
             s["_dir"], s["_missing"] = root / Path(rel).parent, True
             if phase(s) != "done":
                 return s
+    rel = registry(root).get(branch)
+    if rel and not (root / rel / "state.json").exists():
+        return {"title": Path(rel).name, "branch": branch, "approvals": {},
+                "_dir": root / rel, "_missing": True}
     return None
 
 
@@ -498,6 +539,8 @@ def approval_valid(state: dict, ph: str) -> bool:
 def phase(state: dict) -> str:
     if state.get("_corrupt"):
         return "corrupt"
+    if state.get("abandoned"):
+        return "done"
     for ph in PHASES:
         if not approval_valid(state, ph):
             return ph
@@ -617,6 +660,7 @@ def cmd_new(a) -> None:
              "_dir": d}
     save(state)
     save_baseline(root, state)
+    set_registry(root, branch, str(d.relative_to(root)))
     print(json.dumps({"dir": str(d.relative_to(root)), "branch": branch, "base": base,
                       "track": a.track, "phase": phase(state)}))
 
@@ -688,6 +732,8 @@ def cmd_approve(a) -> None:
     save(s)
     if ph in ("spec", "plan") and approval_valid(s, "spec") and approval_valid(s, "plan"):
         save_baseline(root, s, approved=True)
+    if ph == "ship":
+        set_registry(root, s["branch"], None)
     print(json.dumps(_status(s, root), indent=2))
 
 
@@ -736,6 +782,44 @@ def cmd_check_diagrams(a) -> None:
     print("OK: diagrams lint clean" + ("" if shutil.which("mmdc") else " (mmdc not installed: syntax lint only)"))
 
 
+def cmd_revert_drift(a) -> None:
+    """Restore files the drift check reported to their state at the baseline."""
+    root = _root_or_die()
+    s = _feature_or_die(root)
+    if approval_valid(s, "spec") and approval_valid(s, "plan"):
+        sys.exit("sdlc: the plan is approved — nothing to revert.")
+    drifted, base = set(drift(root, s)), baseline_files(root, s)
+    for rel in a.paths:
+        rel = str(Path(rel))
+        if rel not in drifted:
+            sys.exit(f"sdlc: {rel} isn't in the drift list — refusing to touch it.")
+    for rel in a.paths:
+        f, h = root / rel, base.get(str(Path(rel)))
+        if h:  # was already dirty at the baseline: restore that exact content
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(subprocess.run(["git", "-C", str(root), "cat-file", "-p", h],
+                                         capture_output=True, check=True).stdout)
+        elif h == "" or git(root, "ls-files", "--error-unmatch", "--", rel) is None:
+            if f.is_file():
+                f.unlink()  # created after the baseline (or deleted at it)
+        else:
+            git(root, "checkout", "--", rel)
+        print(f"reverted {rel}")
+
+
+def cmd_abandon(a) -> None:
+    root = _root_or_die()
+    if not (a.note or "").strip():
+        sys.exit("sdlc: abandoning a feature needs --note with the user's words.")
+    branch = current_branch(root)
+    s = active_feature(root)
+    set_registry(root, branch, None)
+    if s and not s.get("_corrupt") and (s["_dir"] / "state.json").exists():
+        s["abandoned"] = {"at": now(), "note": a.note}
+        save(s)
+    print(f"abandoned the SDLC feature on '{branch}'")
+
+
 def cmd_check_branch(a) -> None:
     root = _root_or_die()
     s = active_feature(root)
@@ -766,13 +850,18 @@ def main(argv: list[str] | None = None) -> None:
     ro = sub.add_parser("reopen", help="clear a gate and every later one")
     ro.add_argument("phase", choices=PHASES)
     ro.add_argument("--note")
+    rd = sub.add_parser("revert-drift", help="restore files reported as unapproved changes")
+    rd.add_argument("paths", nargs="+")
+    ab = sub.add_parser("abandon", help="drop this branch's feature (user's words required)")
+    ab.add_argument("--note")
     cd = sub.add_parser("check-diagrams", help="lint mermaid diagrams (active spec/plan, or given files)")
     cd.add_argument("files", nargs="*")
     cb = sub.add_parser("check-branch", help="exit non-zero if this branch is stale/base")
     cb.add_argument("--base")
     a = p.parse_args(argv)
     {"new": cmd_new, "status": cmd_status, "approve": cmd_approve,
-     "reopen": cmd_reopen, "track": cmd_track, "check-diagrams": cmd_check_diagrams, "check-branch": cmd_check_branch}[a.cmd](a)
+     "reopen": cmd_reopen, "track": cmd_track, "revert-drift": cmd_revert_drift, "abandon": cmd_abandon,
+     "check-diagrams": cmd_check_diagrams, "check-branch": cmd_check_branch}[a.cmd](a)
 
 
 if __name__ == "__main__":

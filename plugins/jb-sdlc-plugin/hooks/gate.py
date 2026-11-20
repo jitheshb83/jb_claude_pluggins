@@ -30,7 +30,8 @@ import sdlc  # noqa: E402
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 _RAW = ""
-TREE = "\0tree"  # write target meaning "rewrites tracked files" (merge, apply, stash pop, ...)
+TREE = "\0tree:"    # + repo dir: "rewrites tracked files" (merge, apply, stash pop, ...)
+CLEAN = "\0clean:"  # + repo dir: "deletes untracked files" (git clean, stash -u)
 # Prefix commands that run another command, with the options that take a value.
 WRAPPERS: dict[str, set[str]] = {
     "sudo": {"-u", "-g", "-h", "-p", "-C", "-U", "-r", "-t", "-D"}, "doas": {"-u", "-C"},
@@ -139,6 +140,10 @@ def split_commands(cmd: str) -> list[str]:
             elif c == "\\" and q == '"' and i + 1 < len(cmd):
                 cur.append(cmd[i + 1])
                 i += 1
+        elif c == "\\" and i + 1 < len(cmd):
+            cur.append(c + cmd[i + 1])  # an escaped quote or separator is literal
+            i += 2
+            continue
         elif c in "'\"":
             q = c
             cur.append(c)
@@ -188,6 +193,34 @@ def strip_wrappers(toks: list[str]) -> list[str]:
     return toks
 
 
+PROTECTED_ENV = re.compile(r"^(?:CLAUDECODE|SDLC_[A-Z_]+|GIT_CONFIG_\w+)$")
+
+
+def env_evasion(toks: list[str]) -> bool:
+    """True if this simple command sets/unsets a variable the gates depend on."""
+    i = 0
+    while i < len(toks) and re.match(r"^\w+=", toks[i]):
+        if PROTECTED_ENV.match(toks[i].split("=", 1)[0]):
+            return True
+        i += 1
+    rest = toks[i:]
+    if not rest:
+        return False
+    cmd = base(rest[0])
+    if cmd in ("export", "unset", "declare", "typeset", "readonly", "local"):
+        return any(PROTECTED_ENV.match(a.split("=", 1)[0].lstrip("-")) for a in rest[1:])
+    if cmd == "env":
+        args = rest[1:]
+        for j, a in enumerate(args):
+            if a in ("-i", "--ignore-environment") or a.startswith("-i"):
+                return True
+            if a in ("-u", "--unset") and j + 1 < len(args) and PROTECTED_ENV.match(args[j + 1]):
+                return True
+            if "=" in a and PROTECTED_ENV.match(a.split("=", 1)[0]):
+                return True
+    return False
+
+
 def segments(command: str, cwd: Path):
     """Yield (dir, tokens, raw) per simple command, following cd, subshells,
     wrappers (sudo/env/...) and `bash -c` payloads."""
@@ -200,9 +233,9 @@ def segments(command: str, cwd: Path):
                 toks = shlex.split(raw)
             except ValueError:
                 toks = raw.split()
-            if ENV_EVASION.search(" ".join(toks)):
-                block("refused: the command changes CLAUDECODE / SDLC_* in its environment, which "
-                      "would switch the SDLC gates off. Only the user sets those.")
+            if env_evasion(toks):
+                block("refused: the command changes CLAUDECODE / SDLC_* / GIT_CONFIG_* in its "
+                      "environment, which would switch the SDLC gates off. Only the user sets those.")
             toks = strip_wrappers(toks)
             if not toks:
                 continue
@@ -260,7 +293,9 @@ def _inplace_files(cmd: str, toks: list[str]) -> list[str]:
             script_given, i = True, i + 2
             continue
         if t.startswith("-") and t != "-":
-            if "i" in t.lstrip("-") and (t.startswith("-i") or cmd == "perl"):
+            sed_inplace = cmd != "perl" and (re.fullmatch(r"-[A-Za-z]*i.*", t)
+                                             or t == "--in-place" or t.startswith("--in-place="))
+            if sed_inplace or (cmd == "perl" and "i" in t.lstrip("-")):
                 inplace = True
                 nxt = toks[i + 1] if i + 1 < len(toks) else None
                 if cmd != "perl" and t == "-i" and nxt is not None and (nxt == "" or nxt.startswith(".")):
@@ -318,23 +353,27 @@ def write_targets(toks: list[str], raw: str, here: Path) -> list[str]:
     elif cmd in ("sed", "gsed", "perl"):
         targets += _inplace_files(cmd, toks)
     elif cmd == "patch":
-        targets.append(TREE)
+        targets.append(TREE + str(here))
     elif cmd == "git":
-        _, sub, gargs = parse_git(here, toks)
+        d, sub, gargs = parse_git(here, toks)
         hard_reset = sub == "reset" and any(f in gargs for f in ("--hard", "--merge", "--keep"))
         stash_out = sub == "stash" and gargs[:1] in (["pop"], ["apply"])
-        if sub == "apply" or sub in GIT_TREE_REWRITES or hard_reset or stash_out:
-            targets.append(TREE)
+        stash_untracked = sub == "stash" and any(
+            f in gargs for f in ("-u", "--include-untracked", "-a", "--all"))
+        if sub == "clean" or stash_untracked:
+            targets.append(CLEAN + str(d))
+        elif sub == "apply" or sub in GIT_TREE_REWRITES or hard_reset or stash_out:
+            targets.append(TREE + str(d))
         elif sub in GIT_PATH_SUBS:
             if "--" in gargs:
                 ops = [t for t in gargs[gargs.index("--") + 1:] if t]
                 whole = sub in ("checkout", "restore") and any(
-                    (here / t).resolve() == (sdlc.repo_root(here) or here) for t in ops)
-                targets += [TREE] if whole else ops
+                    (d / t).resolve() == (sdlc.repo_root(d) or d) for t in ops)
+                targets += [TREE + str(d)] if whole else [str(d / t) for t in ops]
             elif sub in ("rm", "mv"):
-                targets += [t for t in gargs if not t.startswith("-") and t]
+                targets += [str(d / t) for t in gargs if not t.startswith("-") and t]
             else:  # checkout/restore <path>: only operands that are existing files
-                targets += [t for t in gargs if not t.startswith("-") and (here / t).is_file()]
+                targets += [str(d / t) for t in gargs if not t.startswith("-") and (d / t).is_file()]
     return targets
 
 
@@ -383,7 +422,8 @@ def gate_bash(command: str, cwd: Path, depth: int = 0) -> None:
     if not allow_push and "push" in found:
         block("`git push` refused — the SDLC never pushes. Tell the user the branch is "
               "ready and give them the exact push command to run themselves.")
-    if found and HOOK_EVASION.search(text) or re.search(r"\bunset\b[^;&|\n]*\bGIT_CONFIG", text):
+    runs_git = re.search(r"(?<![\w.-])[\"']?git[\"']?(?:\s|$)", scan)
+    if runs_git and HOOK_EVASION.search(text) or re.search(r"\bunset\b[^;&|\n]*\bGIT_CONFIG", text):
         block("refused: this command would skip or override the SDLC git hooks "
               "(--no-verify, core.hooksPath, GIT_CONFIG_*).")
     if GH_API_PUBLISH.search(scan) and not allow_push:
@@ -422,14 +462,21 @@ def gate_bash(command: str, cwd: Path, depth: int = 0) -> None:
                 if cur in sdlc.BASE_BRANCHES or cur == sdlc.default_base(root):
                     block(f"`git merge` into '{cur}' refused — the SDLC never merges into the base; "
                           f"the user merges the PR.")
-            if root and sub in ("commit", "push"):
+            if root and sub in ("commit", "push", "cherry-pick", "revert", "am", "merge", "pull", "rebase") \
+                    and "--abort" not in args:
                 feat = sdlc.active_feature(root)
                 reason = sdlc.check_branch(root, (feat or {}).get("base"))
                 if reason:
                     block(f"`git {sub}` refused — {reason}")
         for t in write_targets(toks, raw, here):
-            if t == TREE:
-                reason = path_block((sdlc.repo_root(here) or here), held_check=False)
+            if t.startswith((TREE, CLEAN)):
+                d = Path(t.split(":", 1)[1])
+                r = sdlc.repo_root(d) or d
+                untracked = t.startswith(CLEAN) and sdlc.git(
+                    r, "ls-files", "--others", "--exclude-standard", "--", str(sdlc.SDLC_DIR))
+                reason = (f"this would delete uncommitted SDLC docs ({untracked.splitlines()[0]}); "
+                          f"commit docs/sdlc first or ask the user" if untracked
+                          else path_block(r, held_check=False))
             else:
                 reason = path_block((here / os.path.expanduser(t)).resolve())
             if reason:

@@ -41,11 +41,14 @@ the user's step.
    git add -A && git commit -m "<summary>"
    ```
 6. **Hand over** in five lines or fewer: the branch, the commit count, the
-   verification status, and the commands for the user to run:
+   verification status, and the commands for the user to run. They can run
+   them in their own terminal, or inside Claude Code with the `!` prefix:
    ```bash
-   git push -u origin <branch>
-   gh pr create --base <base> --title "<title>" --body-file docs/sdlc/<feature>/pr.md
+   ! SDLC_ALLOW_PUSH=1 git push -u origin <branch>
+   ! SDLC_ALLOW_PUSH=1 gh pr create --base <base> --title "<title>" --body-file docs/sdlc/<feature>/pr.md
    ```
+   `SDLC_ALLOW_PUSH=1` lets the session's git hooks pass the user's own push.
+   Claude can't run this form: the gate refuses inline `SDLC_*` variables.
    Then remind them of two things:
    - After the PR merges, run `git checkout main && git pull`. The hook
      blocks further commits on this branch.

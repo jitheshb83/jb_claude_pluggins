@@ -33,9 +33,12 @@ def main() -> None:
     changed = sdlc.drift(root, feat)
     if changed:
         shown = ", ".join(changed[:8]) + (f" (+{len(changed) - 8} more)" if len(changed) > 8 else "")
+        cli = Path(__file__).resolve().parent.parent / "scripts" / "sdlc.py"
         msg = (f"[jb-sdlc] Code changed before '{feat['title']}' has an approved plan: {shown}. "
-               f"Revert these changes now (git checkout -- <file> / delete new files) and continue "
-               f"the plan phase; the pre-commit hook will refuse to commit them.")
+               f"If your commands made these changes, restore them with "
+               f"`python3 \"{cli}\" revert-drift <paths>`. If they could be the user's own edits, "
+               f"ask the user instead; never revert their work. The pre-commit hook refuses to "
+               f"commit unapproved code either way.")
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse",
                                                  "additionalContext": msg}}))
 

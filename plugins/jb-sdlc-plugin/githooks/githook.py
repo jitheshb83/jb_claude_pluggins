@@ -28,7 +28,8 @@ def enforce(name: str, root: Path, data: bytes = b"") -> None:
         return
     allow_push = os.environ.get("SDLC_ALLOW_PUSH", "").lower() in ("1", "true", "yes")
     if name == "pre-push" and not allow_push:
-        refuse("the SDLC never pushes. The user pushes this branch themselves.")
+        refuse("the SDLC never pushes. The user pushes from their own terminal, or in Claude Code "
+               "with `! SDLC_ALLOW_PUSH=1 git push ...`.")
     branch = sdlc.current_branch(root)
     if name == "pre-merge-commit" and (branch in sdlc.BASE_BRANCHES or branch == sdlc.default_base(root)):
         refuse(f"the SDLC never merges into '{branch}'. The user merges the PR.")
@@ -39,10 +40,11 @@ def enforce(name: str, root: Path, data: bytes = b"") -> None:
             if len(parts) != 3 or not parts[2].startswith("refs/heads/"):
                 continue
             b = parts[2].removeprefix("refs/heads/")
-            if b in bases and parts[1] != sdlc.git(root, "rev-parse", "--verify", "--quiet",
-                                                   f"refs/remotes/origin/{b}"):
-                refuse(f"refusing to move '{b}' to a commit that isn't origin/{b}: the SDLC never "
-                       f"changes the base branch (only fast-forwards it to the remote).")
+            remotes = set((sdlc.git(root, "for-each-ref", "--format=%(objectname)",
+                                    f"refs/remotes/*/{b}") or "").split())
+            if b in bases and parts[1] not in remotes:
+                refuse(f"refusing to move '{b}' to a commit no remote has: the SDLC never changes "
+                       f"the base branch, it only fast-forwards it to a remote's {b}.")
     if name == "pre-commit":
         feat = sdlc.active_feature(root)
         reason = sdlc.check_branch(root, (feat or {}).get("base"))

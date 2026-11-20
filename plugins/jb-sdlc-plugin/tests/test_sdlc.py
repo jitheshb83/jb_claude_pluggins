@@ -934,6 +934,98 @@ class TestFifthReview(Repo):
         self.assertEqual(sorted(dirty), ["renamed.py"])
 
 
+class TestSixthReview(Repo):
+    def blocked(self, cmd, cwd=None):
+        return gate(cwd or self.repo, "Bash", {"command": cmd}).returncode == 2
+
+    def test_drift_revert_path_works_and_is_scoped(self):  # finding 1
+        (self.repo / "keep.txt").write_text("user's pre-existing edit\n")
+        cli(self.repo, "new", "Revert")
+        (self.repo / "app.py").write_text("x = 'unapproved'\n")
+        (self.repo / "new.py").write_text("n = 1\n")
+        (self.repo / "keep.txt").write_text("changed after baseline\n")
+        self.assertIn("revert-drift", subprocess.run(
+            [sys.executable, str(DRIFT)], input=json.dumps({"tool_name": "Bash", "cwd": str(self.repo)}),
+            env=ENV, capture_output=True, text=True).stdout)
+        self.assertIn("isn't in the drift list", cli(self.repo, "revert-drift", "README.md", check=False).stderr)
+        cli(self.repo, "revert-drift", "app.py", "new.py", "keep.txt")
+        self.assertEqual((self.repo / "app.py").read_text(), "x = 1\n")
+        self.assertFalse((self.repo / "new.py").exists())
+        self.assertEqual((self.repo / "keep.txt").read_text(), "user's pre-existing edit\n")
+        self.assertFalse(self.blocked(f"python3 {CLI} revert-drift app.py"))
+
+    def test_clean_and_stash_u_cannot_delete_uncommitted_feature(self):  # finding 2
+        cli(self.repo, "new", "Untracked")
+        for cmd in ("git clean -fd", "git clean -fdx", "git stash -u", "git stash push --include-untracked"):
+            self.assertTrue(self.blocked(cmd), cmd)
+        import shutil
+        shutil.rmtree(self.feature_dir())  # however it happened
+        r = gate(self.repo, "Edit", {"file_path": str(self.repo / "app.py")})
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--note", cli(self.repo, "abandon", check=False).stderr)
+        cli(self.repo, "abandon", "--note", "user: drop it")
+        self.assertEqual(gate(self.repo, "Edit", {"file_path": str(self.repo / "app.py")}).returncode, 0)
+
+    def test_git_dash_C_paths_resolve_against_the_repo(self):  # finding 3
+        cli(self.repo, "new", "DashC")
+        outside = Path(self.tmp.name)
+        for cmd in (f"git -C {self.repo.name} apply x.diff", f"git -C {self.repo.name} checkout -- app.py",
+                    f"git -C {self.repo.name} rm app.py", f"git -C {self.repo.name} reset --hard"):
+            self.assertTrue(self.blocked(cmd, cwd=outside), cmd)
+
+    def test_alias_cannot_carry_hook_overrides(self):  # finding 4
+        sh(self.repo, "git", "checkout", "-qb", "feature/x")
+        sh(self.repo, "git", "config", "alias.ci", "commit")
+        self.assertTrue(self.blocked("git -c core.hooksPath=/dev/null ci -m x"))
+        self.assertTrue(self.blocked("git -c core.hooksPath=/dev/null status"))
+
+    def test_quoted_env_names_are_data(self):  # finding 5
+        sh(self.repo, "git", "checkout", "-qb", "feature/x")
+        for cmd in ('grep -n "SDLC_GATES=off" README.md', 'git commit -m "document SDLC_ALLOW_PUSH=1"',
+                    "rg 'CLAUDECODE=1' docs"):
+            self.assertFalse(self.blocked(cmd), cmd)
+        for cmd in ("SDLC_GATES=off git commit -m x", "bash -c 'SDLC_GATES=off git commit -m x'",
+                    "export GIT_CONFIG_COUNT=0", "env --unset=CLAUDECODE git push"):
+            self.assertTrue(self.blocked(cmd), cmd)
+
+    def test_fork_upstream_fast_forward_is_allowed(self):  # finding 6
+        up = Path(self.tmp.name) / "upstream.git"
+        sh(Path(self.tmp.name), "git", "clone", "-q", "--bare", str(self.remote), str(up))
+        sh(self.repo, "git", "remote", "add", "upstream", str(up))
+        other = Path(self.tmp.name) / "up-work"
+        sh(Path(self.tmp.name), "git", "clone", "-q", str(up), str(other))
+        (other / "f.py").write_text("f = 1\n")
+        sh(other, "git", "add", ".")
+        sh(other, "git", "commit", "-qm", "upstream change")
+        sh(other, "git", "push", "-q", "origin", "main")
+        env = claude_env()
+        self.assertEqual(run(self.repo, "git", "pull", "-q", "--ff-only", "upstream", "main", env=env).returncode, 0)
+
+    def test_commit_creating_commands_check_freshness(self):  # finding 7
+        for cmd in ("git cherry-pick abc123", "git revert HEAD", "git am p.mbox"):
+            self.assertTrue(self.blocked(cmd), cmd)  # on main
+        self.assertFalse(self.blocked("git merge --abort"))
+
+    def test_sed_inplace_variants(self):  # finding 8
+        cli(self.repo, "new", "SedForms")
+        for cmd in ("sed -Ei 's/a/b/' app.py", "sed -ri 's/a/b/' app.py", "sed --in-place 's/a/b/' app.py",
+                    "sed --in-place=.bak -e 's/a/b/' app.py"):
+            self.assertTrue(self.blocked(cmd), cmd)
+        self.assertFalse(self.blocked("sed -E 's/a/b/' app.py"))
+
+    def test_escaped_quote_outside_quotes_keeps_splitting(self):  # finding 9
+        cli(self.repo, "new", "Esc")
+        self.assertTrue(self.blocked('echo \\"; rm app.py'))
+        self.assertTrue(self.blocked("echo \\'; rm app.py"))
+
+    def test_handoff_push_is_allowed_for_the_user(self):  # finding 10
+        sh(self.repo, "git", "checkout", "-qb", "feature/handoff")
+        r = run(self.repo, "git", "push", "-q", "-u", "origin", "feature/handoff",
+                env=claude_env(SDLC_ALLOW_PUSH="1"))  # what `! SDLC_ALLOW_PUSH=1 git push` does
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("SDLC_ALLOW_PUSH=1", (PLUGIN / "skills" / "sdlc-ship" / "SKILL.md").read_text())
+
+
 class TestBranchGate(Repo):
     def commit(self, cmd="git commit -m wip"):
         return gate(self.repo, "Bash", {"command": cmd})

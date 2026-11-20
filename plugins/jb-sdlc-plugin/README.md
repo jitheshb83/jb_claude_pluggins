@@ -43,7 +43,7 @@ flowchart LR
 | `githooks/` | git hooks | `pre-push` refuses any push from a Claude session. `pre-commit` runs the fresh-branch check and refuses code commits before plan approval. `pre-merge-commit` refuses merges into the base, and `reference-transaction` refuses moving `main`/`master` anywhere except to `origin/<base>`, so `git pull` still works. All of them hand off to the repo's own hooks. |
 | `hooks/drift.py` | PostToolUse (Bash) | Checks results, not command text: reports code files changed since the feature started while the plan is unapproved. |
 | `hooks/gate.py` | PreToolUse | Blocks every `git push`, `gh pr create` and `gh pr merge`, and merges into the base. Blocks commits on main or merged branches, and edits to `state.json`. Blocks code changes before the plan is approved, whether made with the Edit/Write tools or through the shell. |
-| `scripts/sdlc.py` | stdlib CLI | `new`, `track`, `status`, `approve`, `reopen`, `check-diagrams`, `check-branch`. |
+| `scripts/sdlc.py` | stdlib CLI | `new`, `track`, `status`, `approve`, `reopen`, `revert-drift`, `abandon`, `check-diagrams`, `check-branch`. |
 | `references/diagrams.md` | — | Mermaid house style (muted, semantic palette that works in light and dark themes) and templates: user flow, change map, sequence, lanes, state, ER. |
 
 ## Cost model
@@ -141,7 +141,7 @@ file re-opens its gate and every gate after it.
 | Switch | Effect |
 |---|---|
 | `SDLC_GATES=off` | Disables every gate. |
-| `SDLC_ALLOW_PUSH=1` | Lets Claude push or open a PR in this session. Off by default. |
+| `SDLC_ALLOW_PUSH=1` | Lets pushes and PRs through. Claude can't set it inline, but **you** can, for the hand-off: `! SDLC_ALLOW_PUSH=1 git push …`. Setting it before the session starts lets Claude push too. |
 | `SDLC_AUTOROUTE=off` | Disables the router. |
 | `SDLC_LEAN=off` | Disables the output-token watchdog. |
 | `SDLC_NO_GH=1` | Skips the merged-PR lookup. |
@@ -165,15 +165,19 @@ undo local controls. Enforcement works in layers, strongest first:
    unaffected. `--no-verify` and `core.hooksPath`/`GIT_CONFIG_*` overrides
    are refused by the text gate, as are inline `CLAUDECODE`/`SDLC_*` assignments and `env -i`/`env -u`.
 2. **Results check (`drift.py`).** After every Bash command it compares
-   `git status` against the baseline recorded by `sdlc.py new`. Unapproved
-   code changes are reported to Claude for reverting, and the pre-commit
-   hook won't commit them.
+   `git status` against the baseline recorded by `sdlc.py new`. Claude is
+   told about unapproved code changes and reverts its own with
+   `sdlc.py revert-drift <paths>`, which only touches reported files. It
+   asks you before reverting anything that could be your own edit. The
+   pre-commit hook won't commit such changes either way.
 3. **Text gate (`gate.py`).** An early warning before a command runs.
    It's thorough but not complete by design. On an internal error it
    blocks git/gh commands and allows everything else.
-4. **State integrity.** An unreadable `state.json`, or a committed feature
-   folder deleted from the working tree, blocks code changes instead of
-   switching the gates off.
+4. **State integrity.** If `state.json` is unreadable, or the feature folder
+   has been deleted (whether committed or not, since the git dir keeps a
+   registry), code changes are blocked rather than the gates switching off.
+   `git clean` and `git stash -u` are refused while the feature docs are
+   uncommitted. `sdlc.py abandon --note` drops a feature on your say-so.
 
 **What the hooks can't check:**
 - whether an approval was really typed by you (the skills require your
