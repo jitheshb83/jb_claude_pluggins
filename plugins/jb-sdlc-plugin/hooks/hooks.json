@@ -1,0 +1,28 @@
+{
+  "description": "jb-sdlc-plugin: route development prompts to the sdlc skill; gate commits/pushes on main/master or merged branches; gate code edits before the plan is approved.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/route.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/gate.py\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
