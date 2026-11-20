@@ -650,6 +650,207 @@ class TestThirdReview(Repo):
             cli(self.repo, "reopen", "plan")
 
 
+GITHOOKS = PLUGIN / "githooks"
+SESSION = PLUGIN / "hooks" / "session.py"
+DRIFT = PLUGIN / "hooks" / "drift.py"
+
+
+def claude_env(**extra):
+    """Environment of a Claude Code Bash command with the session hooks installed."""
+    env = {**ENV, "CLAUDECODE": "1", "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.hooksPath",
+           "GIT_CONFIG_VALUE_0": str(GITHOOKS), "SDLC_NO_FETCH": "1"}
+    env.pop("SDLC_ALLOW_PUSH", None)
+    env.update(extra)
+    return env
+
+
+def run(cwd, *args, env):
+    return subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True)
+
+
+class TestGitHooks(Repo):
+    """Git-level enforcement: holds however the command is spelled."""
+
+    def test_push_refused_in_claude_sessions_only(self):
+        sh(self.repo, "git", "checkout", "-qb", "feature/x")
+        env = claude_env()
+        for args in (["git", "push", "-q", "origin", "HEAD"],
+                     ["/usr/bin/git", "push", "-q", "origin", "HEAD"],
+                     ["git", "-c", "alias.p=push", "p", "-q", "origin", "HEAD"],
+                     ["sh", "-c", "timeout_free=1 git push -q origin HEAD"]):
+            r = run(self.repo, *args, env=env)
+            self.assertNotEqual(r.returncode, 0, args)
+            self.assertIn("never pushes", r.stderr, args)
+        self.assertEqual(run(self.repo, "git", "push", "-q", "origin", "HEAD",
+                             env=claude_env(SDLC_ALLOW_PUSH="1")).returncode, 0)
+        user_env = {k: v for k, v in env.items() if k != "CLAUDECODE"}
+        sh(self.repo, "git", "push", "-q", "origin", "--delete", "feature/x")
+        self.assertEqual(run(self.repo, "git", "push", "-q", "origin", "HEAD", env=user_env).returncode, 0)
+
+    def test_pre_commit_checks_branch_and_plan(self):
+        env = claude_env()
+        (self.repo / "app.py").write_text("x = 2\n")
+        r = run(self.repo, "git", "commit", "-qam", "on main", env=env)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("main", r.stderr)
+        sh(self.repo, "git", "checkout", "-q", "app.py")
+        cli(self.repo, "new", "Hooked")
+        d = self.feature_dir()
+        run(self.repo, "git", "add", "-A", env=env)
+        self.assertEqual(run(self.repo, "git", "commit", "-qm", "docs only", env=env).returncode, 0)
+        (self.repo / "app.py").write_text("x = 3\n")
+        r = run(self.repo, "git", "commit", "-qam", "code", env=env)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no approved plan", r.stderr)
+        (d / "plan.md").write_text(GOOD_PLAN_NODIAG)
+        cli(self.repo, "approve", "plan", "--note", "user: yes")
+        run(self.repo, "git", "add", "-A", env=env)
+        self.assertEqual(run(self.repo, "git", "commit", "-qm", "code", env=env).returncode, 0)
+
+    def test_chains_to_the_repos_own_hooks(self):
+        env = claude_env()
+        sh(self.repo, "git", "checkout", "-qb", "feature/chain")
+        own = self.repo / ".git" / "hooks"
+        (own / "pre-commit").write_text("#!/bin/sh\ntouch \"$(git rev-parse --show-toplevel)/.ran-pre-commit\"\n")
+        (own / "commit-msg").write_text("#!/bin/sh\ngrep -q ticket \"$1\" || { echo needs ticket >&2; exit 1; }\n")
+        for h in own.iterdir():
+            h.chmod(0o755)
+        (self.repo / "b.py").write_text("b = 1\n")
+        run(self.repo, "git", "add", "b.py", env=env)
+        r = run(self.repo, "git", "commit", "-qm", "no id", env=env)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("needs ticket", r.stderr)
+        self.assertEqual(run(self.repo, "git", "commit", "-qm", "ticket 1", env=env).returncode, 0)
+        self.assertTrue((self.repo / ".ran-pre-commit").exists())
+        custom = Path(self.tmp.name) / "custom-hooks"
+        custom.mkdir()
+        (custom / "post-commit").write_text("#!/bin/sh\ntouch \"$(git rev-parse --show-toplevel)/.ran-custom\"\n")
+        (custom / "post-commit").chmod(0o755)
+        sh(self.repo, "git", "config", "--local", "core.hooksPath", str(custom))
+        (self.repo / "c.py").write_text("c = 1\n")
+        run(self.repo, "git", "add", "c.py", env=env)
+        self.assertEqual(run(self.repo, "git", "commit", "-qm", "ticket 2", env=env).returncode, 0)
+        self.assertTrue((self.repo / ".ran-custom").exists())
+
+
+class TestSessionInstaller(Repo):
+    def test_env_file_routes_git_through_plugin_hooks(self):
+        envf = Path(self.tmp.name) / "env.sh"
+        r = subprocess.run([sys.executable, str(SESSION)], env={**ENV, "CLAUDE_ENV_FILE": str(envf)},
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        base_env = {k: v for k, v in ENV.items() if not k.startswith(("GIT_CONFIG", "SDLC_GITHOOKS"))}
+        probe = f". {envf}; . {envf}; echo $GIT_CONFIG_COUNT; git config --get core.hooksPath"
+        out = subprocess.run(["sh", "-c", probe], cwd=self.repo, env=base_env,
+                             capture_output=True, text=True).stdout.split()
+        self.assertEqual(out, ["1", str(GITHOOKS)])  # sourced twice, installed once
+        out = subprocess.run(["sh", "-c", f". {envf}; echo $GIT_CONFIG_COUNT"], cwd=self.repo,
+                             env={**base_env, "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "user.name",
+                                  "GIT_CONFIG_VALUE_0": "x"}, capture_output=True, text=True).stdout.split()
+        self.assertEqual(out, ["2"])  # appends after existing command-scope config
+        off = subprocess.run(["sh", "-c", f". {envf}; echo ${{GIT_CONFIG_COUNT:-none}}"], cwd=self.repo,
+                             env={**base_env, "SDLC_GATES": "off"}, capture_output=True, text=True).stdout.split()
+        self.assertEqual(off, ["none"])
+        self.assertTrue(all(os.access(f, os.X_OK) for f in GITHOOKS.iterdir()))
+
+
+class TestDriftAndState(Repo):
+    def drift_msg(self):
+        ev = {"hook_event_name": "PostToolUse", "tool_name": "Bash", "cwd": str(self.repo)}
+        r = subprocess.run([sys.executable, str(DRIFT)], input=json.dumps(ev), env=ENV,
+                           capture_output=True, text=True)
+        return json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"] if r.stdout else ""
+
+    def test_unapproved_code_changes_are_reported_but_old_dirt_is_not(self):
+        (self.repo / "scratch.txt").write_text("pre-existing\n")  # dirty before the feature
+        cli(self.repo, "new", "Drift")
+        self.assertEqual(self.drift_msg(), "")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "sneaky.py").write_text("x = 1\n")  # e.g. python -c wrote it
+        (self.repo / "app.py").write_text("x = 99\n")
+        msg = self.drift_msg()
+        self.assertIn("src/sneaky.py", msg)
+        self.assertIn("app.py", msg)
+        self.assertNotIn("scratch.txt", msg)
+        (self.feature_dir() / "plan.md").write_text(GOOD_PLAN_NODIAG)
+        cli(self.repo, "approve", "plan", "--note", "user: yes")
+        self.assertEqual(self.drift_msg(), "")
+
+    def test_corrupt_state_blocks_instead_of_disabling(self):
+        cli(self.repo, "new", "Corrupt")
+        state = self.feature_dir() / "state.json"
+        for bad in ('<<<<<<< HEAD\n{"title": "a"}\n=======\n', '{"title": "x", "branch": "b", "approvals": null}'):
+            state.write_text(bad)
+            r = gate(self.repo, "Edit", {"file_path": str(self.repo / "app.py")})
+            self.assertEqual(r.returncode, 2, bad)
+            self.assertIn("unreadable", cli(self.repo, "status", check=False).stderr)
+
+    def test_deleted_feature_folder_still_gates(self):
+        cli(self.repo, "new", "Vanish")
+        d = self.feature_dir()
+        sh(self.repo, "git", "add", "-A")
+        sh(self.repo, "git", "commit", "-qm", "docs")
+        import shutil
+        shutil.rmtree(d)  # e.g. done by a command the text gate didn't understand
+        r = gate(self.repo, "Edit", {"file_path": str(self.repo / "app.py")})
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("deleted", cli(self.repo, "status", check=False).stderr)
+
+
+class TestFourthReview(Repo):
+    def blocked(self, cmd):
+        return gate(self.repo, "Bash", {"command": cmd}).returncode == 2
+
+    def test_writes_the_parser_used_to_miss(self):  # findings 1, 2, 3, 6, 8
+        cli(self.repo, "new", "Gaps")
+        (self.repo / "src").mkdir()
+        for cmd in ("printf x >src/app.py", "cat x>src/app.py", "echo x >| src/app.py",
+                    "bash -lc 'echo x > src/a.py'", "sh -ec 'touch src/a.py'",
+                    "eval \"sed -i '' s/a/b/ app.py\"", "bash <<'EOF'\necho x > src/a.py\nEOF",
+                    "git stash pop", "git reset --hard HEAD~1", "git cherry-pick abc123",
+                    "cp -t src/ /tmp/a.py", "install --target-directory=src /tmp/a.py"):
+            self.assertTrue(self.blocked(cmd), cmd)
+        for cmd in ("git reset HEAD app.py", "git log --format='%h->%s'", "uv run pytest -q 2>&1 | tail"):
+            self.assertFalse(self.blocked(cmd), cmd)
+
+    def test_shell_fed_heredoc_push_is_seen(self):  # finding 3
+        sh(self.repo, "git", "checkout", "-qb", "feature/x")
+        self.assertTrue(self.blocked("bash <<'EOF'\ngit push origin HEAD\nEOF"))
+        self.assertFalse(self.blocked("git commit -F - <<'EOF'\nmention git push here\nEOF"))
+
+    def test_feature_folder_cannot_be_removed_or_replaced(self):  # finding 4
+        cli(self.repo, "new", "Folder")
+        d = self.status()["dir"]
+        for cmd in (f"rm -rf {d}", "rm -rf docs/sdlc", f"mv {d} /tmp/", f"cp -r /tmp/forged/. {d}/"):
+            self.assertTrue(self.blocked(cmd), cmd)
+        self.assertFalse(self.blocked(f"cp /tmp/notes.md {d}/"))
+
+    def test_aliases_gh_api_and_hook_evasion(self):  # finding 5
+        sh(self.repo, "git", "checkout", "-qb", "feature/x")
+        sh(self.repo, "git", "config", "alias.p", "push")
+        sh(self.repo, "git", "config", "alias.sync", "!git fetch && git push")
+        for cmd in ("git p origin HEAD", "git sync", "gh api repos/o/r/pulls -f title=x",
+                    "gh api -X PUT repos/o/r/pulls/3/merge", "git commit --no-verify -m x",
+                    "git -c core.hooksPath=/dev/null commit -m x", "GIT_CONFIG_COUNT=0 git commit -m x",
+                    "unset GIT_CONFIG_COUNT; git commit -m x"):
+            self.assertTrue(self.blocked(cmd), cmd)
+        self.assertFalse(self.blocked("gh api repos/o/r/pulls -X GET"))
+        self.assertFalse(self.blocked("git st"))
+
+    def test_internal_error_on_git_command_fails_closed(self):  # finding 7
+        ev = {"tool_name": "Bash", "tool_input": {"command": "git commit -m x"}, "cwd": 123}
+        r = subprocess.run([sys.executable, str(GATE)], input=json.dumps(ev), env=ENV,
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        ev["tool_input"]["command"] = "ls"
+        r = subprocess.run([sys.executable, str(GATE)], input=json.dumps(ev), env=ENV,
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0)
+
+    def test_router_with_leading_newline(self):  # nit
+        self.assertIn("sdlc skill", route(self.repo, "\nimplement caching").stdout)
+
+
 class TestBranchGate(Repo):
     def commit(self, cmd="git commit -m wip"):
         return gate(self.repo, "Bash", {"command": cmd})

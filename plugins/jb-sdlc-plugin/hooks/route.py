@@ -20,8 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import sdlc  # noqa: E402
 
 DEV_INTENT = re.compile(
-    r"\b("
-    r"^\s*(?:please\s+)?(?:implement|develop|refactor|build)\b|"
+    r"(?:\A\s*(?:please\s+)?(?:implement|develop|refactor|build)\b)|\b("
     r"(?:please|can you|could you|let'?s|i want to|we need to|need to|help me)\s+"
     r"(?:implement|develop|refactor|build)\b|"
     r"(?:implement|develop|refactor)\s+(?:a|an|the|this|that|my|our|new|support|it)\b|"

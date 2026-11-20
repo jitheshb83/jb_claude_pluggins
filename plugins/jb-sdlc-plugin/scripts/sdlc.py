@@ -352,6 +352,49 @@ def check_content(state: dict, ph: str) -> list[str]:
     return errs
 
 
+# ---------------------------------------------------------------- baseline
+
+
+def _baseline_file(root: Path, state: dict) -> Path | None:
+    gd = git(root, "rev-parse", "--git-common-dir")
+    return (root / gd / f"sdlc-baseline-{state['_dir'].name}.json") if gd else None
+
+
+def dirty_code(root: Path) -> dict[str, str]:
+    """Changed or untracked files outside docs/sdlc -> content hash ('' if deleted)."""
+    out = {}
+    try:  # not via git(): it strips, which would eat the first entry's status column
+        status = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "-uall", "-z"],
+                                capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        status = ""
+    for entry in status.split("\0"):
+        if len(entry) < 4:
+            continue
+        rel = entry[3:]
+        if Path(rel).parts[:2] == SDLC_DIR.parts:
+            continue
+        f = root / rel
+        out[rel] = (git(root, "hash-object", "--", rel) or "") if f.is_file() else ""
+    return out
+
+
+def save_baseline(root: Path, state: dict) -> None:
+    bf = _baseline_file(root, state)
+    if bf:
+        bf.write_text(json.dumps(dirty_code(root)))
+
+
+def drift(root: Path, state: dict) -> list[str]:
+    """Code files changed since the feature started (shell writes the hook can't see)."""
+    bf = _baseline_file(root, state)
+    try:
+        base = json.loads(bf.read_text()) if bf and bf.exists() else {}
+    except ValueError:
+        base = {}
+    return sorted(p for p, h in dirty_code(root).items() if base.get(p) != h)
+
+
 # ------------------------------------------------------------------- state
 
 
@@ -368,8 +411,21 @@ def slugify(text: str) -> str:
     return s[:48].rstrip("-") or "feature"
 
 
+def _valid_state(s) -> bool:
+    return (isinstance(s, dict) and isinstance(s.get("title"), str) and isinstance(s.get("branch"), str)
+            and isinstance(s.get("approvals", {}), dict))
+
+
 def load(state_file: Path) -> dict:
-    s = json.loads(state_file.read_text())
+    """Parse a state.json. Anything unreadable comes back as a *corrupt* state,
+    which blocks code changes instead of silently switching the gate off."""
+    try:
+        s = json.loads(state_file.read_text())
+    except (OSError, ValueError):
+        s = None
+    if not _valid_state(s):
+        return {"title": f"unreadable {state_file.parent.name}/state.json", "branch": None,
+                "approvals": {}, "_dir": state_file.parent, "_corrupt": True}
     s["_dir"] = state_file.parent
     return s
 
@@ -381,22 +437,41 @@ def save(state: dict) -> None:
 
 
 def all_features(root: Path) -> list[dict]:
-    out = []
-    for f in sorted((root / SDLC_DIR).glob("*/state.json")):
-        try:
-            out.append(load(f))
-        except (OSError, json.JSONDecodeError):
+    return [load(f) for f in sorted((root / SDLC_DIR).glob("*/state.json"))]
+
+
+def _deleted_feature(root: Path, branch: str) -> dict | None:
+    """A feature committed on this branch whose folder is gone from the worktree."""
+    listed = git(root, "ls-tree", "-r", "--name-only", "HEAD", "--", str(SDLC_DIR)) or ""
+    for rel in listed.splitlines():
+        if not rel.endswith("/state.json") or (root / rel).exists():
             continue
-    return out
+        try:
+            s = json.loads(git(root, "show", f"HEAD:{rel}") or "")
+        except ValueError:
+            continue
+        if _valid_state(s) and s["branch"] == branch:
+            s["_dir"], s["_missing"] = root / Path(rel).parent, True
+            if phase(s) != "done":
+                return s
+    return None
 
 
 def active_feature(root: Path, branch: str | None = None) -> dict | None:
     branch = current_branch(root) if branch is None else branch
-    hits = [s for s in all_features(root) if s.get("branch") == branch and phase(s) != "done"]
-    return max(hits, key=lambda s: s.get("created", "")) if hits else None
+    feats = all_features(root)
+    corrupt = [s for s in feats if s.get("_corrupt")]
+    if corrupt:
+        return corrupt[0]  # fail closed: an unreadable state blocks until the user fixes it
+    hits = [s for s in feats if s.get("branch") == branch and phase(s) != "done"]
+    if hits:
+        return max(hits, key=lambda s: s.get("created", ""))
+    return _deleted_feature(root, branch) if branch else None
 
 
 def approval_valid(state: dict, ph: str) -> bool:
+    if state.get("_corrupt") or state.get("_missing"):
+        return False
     if ph == "spec" and state.get("track") == "lite":
         return True
     a = state.get("approvals", {}).get(ph)
@@ -408,6 +483,8 @@ def approval_valid(state: dict, ph: str) -> bool:
 
 
 def phase(state: dict) -> str:
+    if state.get("_corrupt"):
+        return "corrupt"
     for ph in PHASES:
         if not approval_valid(state, ph):
             return ph
@@ -466,6 +543,12 @@ def _root_or_die() -> Path:
 
 def _feature_or_die(root: Path) -> dict:
     s = active_feature(root)
+    if s and s.get("_corrupt"):
+        sys.exit(f"sdlc: {s['_dir'].relative_to(root)}/state.json is unreadable (merge conflict?). "
+                 f"Ask the user to fix it by hand; code changes stay blocked until then.")
+    if s and s.get("_missing"):
+        sys.exit(f"sdlc: the feature folder {s['_dir'].relative_to(root)} was deleted from the working "
+                 f"tree. Ask the user to restore it: git checkout HEAD -- {s['_dir'].relative_to(root)}")
     if not s:
         sys.exit(f"sdlc: no active feature for branch '{current_branch(root)}'. "
                  f"Start one with `sdlc.py new \"<title>\"`.")
@@ -520,6 +603,7 @@ def cmd_new(a) -> None:
              "created": now(), "approvals": {}, "history": [{"at": now(), "event": "created"}],
              "_dir": d}
     save(state)
+    save_baseline(root, state)
     print(json.dumps({"dir": str(d.relative_to(root)), "branch": branch, "base": base,
                       "track": a.track, "phase": phase(state)}))
 
@@ -530,14 +614,16 @@ def _status(s: dict, root: Path) -> dict:
         a = s.get("approvals", {}).get(ph)
         gates[ph] = "approved" if approval_valid(s, ph) else ("stale" if a else "open")
     return {"title": s["title"], "track": s.get("track", "full"),
-            "dir": str(s["_dir"].relative_to(root)), "branch": s["branch"],
-            "base": s["base"], "phase": phase(s), "gates": gates,
+            "dir": str(s["_dir"].relative_to(root)), "branch": s.get("branch"),
+            "base": s.get("base"), "phase": phase(s), "gates": gates,
             "evidence": s.get("approvals", {}).get("build", {}).get("evidence")}
 
 
 def cmd_status(a) -> None:
     root = _root_or_die()
     s = active_feature(root)
+    if s and (s.get("_corrupt") or s.get("_missing")):
+        _feature_or_die(root)
     if not s:
         print(json.dumps({"active": None, "branch": current_branch(root),
                           "features": [_status(f, root) for f in all_features(root)][-5:]}, indent=2))

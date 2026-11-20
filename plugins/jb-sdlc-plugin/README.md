@@ -39,6 +39,9 @@ flowchart LR
 | `sdlc-reviewer` agent | **sonnet**, `high`, 40 turns | Fresh-context review against the ACs and plan, tests and private-data leaks. |
 | `hooks/route.py` | UserPromptSubmit | Adds one context line pointing development prompts at `sdlc`, and announces the active feature and phase. |
 | `hooks/lean.py` | PostToolUse | Flags output-token waste as it's written: comment-heavy edits, comments that narrate code, commented-out code, and whole-file Writes that changed only a little. It sends a one-line hint back and never blocks. |
+| `hooks/session.py` | SessionStart | Routes this session's git through `githooks/` (via `CLAUDE_ENV_FILE`; no repo or global config changes). |
+| `githooks/` | git hooks | `pre-push` refuses any push from a Claude session. `pre-commit` runs the fresh-branch check and refuses code commits before plan approval. `pre-merge-commit` refuses merges into the base. All of them hand off to the repo's own hooks. |
+| `hooks/drift.py` | PostToolUse (Bash) | Checks results, not command text: reports code files changed since the feature started while the plan is unapproved. |
 | `hooks/gate.py` | PreToolUse | Blocks every `git push`, `gh pr create` and `gh pr merge`, and merges into the base. Blocks commits on main or merged branches, and edits to `state.json`. Blocks code changes before the plan is approved, whether made with the Edit/Write tools or through the shell. |
 | `scripts/sdlc.py` | stdlib CLI | `new`, `track`, `status`, `approve`, `reopen`, `check-diagrams`, `check-branch`. |
 | `references/diagrams.md` | — | Mermaid house style (muted, semantic palette that works in light and dark themes) and templates: user flow, change map, sequence, lanes, state, ER. |
@@ -151,9 +154,31 @@ v2.1.295 or later) and a 30-second limit. Its own network calls (`git fetch`,
 and let a commit through. The gate needs `python3` on `PATH`. If it's
 missing, every Bash and edit call is blocked until you disable the plugin.
 
-**What a hook can't check:**
-- whether an approval was really typed by you (the skills require your words in `--note`);
-- writes from inside interpreters (`python -c`, `node -e`), which the skills forbid before approval.
+**Threat model.** The gates protect against *mistakes*: a push, a commit on a
+stale branch, or code written before you approved the plan. They don't
+protect against a determined adversary; any process with shell access can
+undo local controls. Enforcement works in layers, strongest first:
+
+1. **Git hooks (`githooks/`).** Git runs these however a command is spelled:
+   aliases, absolute paths, wrappers, `bash -c`, heredocs, `eval`. They're
+   active only while `CLAUDECODE=1` is set, so your own terminal is
+   unaffected. `--no-verify` and `core.hooksPath`/`GIT_CONFIG_*` overrides
+   are refused by the text gate.
+2. **Results check (`drift.py`).** After every Bash command it compares
+   `git status` against the baseline recorded by `sdlc.py new`. Unapproved
+   code changes are reported to Claude for reverting, and the pre-commit
+   hook won't commit them.
+3. **Text gate (`gate.py`).** An early warning before a command runs.
+   It's thorough but not complete by design. On an internal error it
+   blocks git/gh commands and allows everything else.
+4. **State integrity.** An unreadable `state.json`, or a committed feature
+   folder deleted from the working tree, blocks code changes instead of
+   switching the gates off.
+
+**What the hooks can't check:**
+- whether an approval was really typed by you (the skills require your
+  words in `--note`);
+- `gh api` calls the text gate doesn't recognise as publishing.
 
 ## Install
 

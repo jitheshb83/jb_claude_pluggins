@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import sdlc  # noqa: E402
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+_RAW = ""
 # Prefix commands that run another command, with the options that take a value.
 WRAPPERS: dict[str, set[str]] = {
     "sudo": {"-u", "-g", "-h", "-p", "-C", "-U", "-r", "-t", "-D"}, "doas": {"-u", "-C"},
@@ -39,19 +40,28 @@ WRAPPERS: dict[str, set[str]] = {
     "command": set(), "nohup": set(), "time": set(), "exec": {"-a"}, "builtin": set(),
 }
 NUMERIC_ARG = {"timeout", "gtimeout", "nice", "taskset", "flock"}  # take a bare value
-SHELLS = {"bash", "sh", "zsh"}
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 # `<<` that opens a heredoc — not `<<<` (here-string) and not a shift inside $((...)).
 HEREDOC = re.compile(r"(?<![<])<<(?!<)-?\s*(['\"]?)([A-Za-z_][\w.-]*)\1")
-REDIRECT_OP = re.compile(r"(?:^|[^<>&\w])(?:\d?>>?|&>>?)\s*")
+REDIRECT_OP = re.compile(r"(?<![<>&=-])(?:\d?>>?|&>>?)\|?\s*")
 # Fail-closed: anywhere in the command, quoted payloads included (bash -c '...',
 # "$(...)", timeout/nice/sudo prefixes, `&` chains). Heredoc bodies are skipped.
 GIT_OPTS = r"(?:\s+(?:-C|-c|--git-dir|--work-tree)\s+\S+|\s+-{1,2}[\w-]+(?:=\S+)?)*"
 ANY_GIT = re.compile(r"(?<![\w.-])[\"']?git[\"']?" + GIT_OPTS + r"\s+(push|commit|merge)\b")
 ANY_GH_PR = re.compile(r"(?<![\w.-])[\"']?gh[\"']?(?:\s+-{1,2}[\w-]+(?:[= ]\S+)?)*\s+pr\s+(create|merge)\b")
 GH_VALUE_OPTS = {"-R", "--repo", "--hostname"}
+GH_API_PUBLISH = re.compile(r"(?<![\w.-])gh\b[^;&|\n]*\bapi\b[^;&|\n]*/(?:pulls|merges)\b(?![^;&|\n]*(?:-X|--method)\s*GET)")
+HOOK_EVASION = re.compile(r"--no-verify\b|\bcore\.hooksPath\b|\bGIT_CONFIG_(?:COUNT|KEY|VALUE|PARAMETERS|GLOBAL|SYSTEM|NOSYSTEM)\b|\bSDLC_GITHOOKS\b")
 ALL_ARGS = {"rm", "touch", "mkdir", "rmdir", "truncate", "tee", "mv"}
 DEST_ARG = {"cp", "install", "ln", "rsync"}
 GIT_PATH_SUBS = {"rm", "mv", "checkout", "restore"}
+GIT_TREE_REWRITES = {"cherry-pick", "am", "revert", "merge", "pull", "rebase"}  # rewrite tracked files
+GIT_SUBCOMMANDS = GIT_PATH_SUBS | GIT_TREE_REWRITES | {
+    "add", "apply", "bisect", "blame", "branch", "clone", "commit", "config", "describe", "diff",
+    "fetch", "grep", "init", "log", "ls-files", "ls-tree", "notes", "push", "reflog", "remote",
+    "reset", "rev-list", "rev-parse", "shortlog", "show", "stash", "status", "switch", "tag",
+    "worktree", "cat-file", "hash-object", "symbolic-ref", "for-each-ref", "help", "version",
+    "clean", "gc", "submodule", "sparse-checkout", "format-patch", "range-diff", "merge-base"}
 
 
 def block(msg: str) -> None:
@@ -59,11 +69,16 @@ def block(msg: str) -> None:
     sys.exit(2)
 
 
+SHELL_FED = re.compile(r"(?:^|[\s;&|(])(?:\S*/)?(?:bash|sh|zsh|dash|ksh|eval|xargs|ssh)\b[^|;&]*$")
+
+
 def _heredoc_start(line: str):
     for m in HEREDOC.finditer(line):
         before = line[:m.start()]
         if before.count("$((") > before.count("))"):
             continue  # arithmetic shift, e.g. $((a<<b))
+        if SHELL_FED.search(before):
+            continue  # `bash <<EOF`: the body runs, so keep it visible to the checks
         return m
     return None
 
@@ -127,8 +142,8 @@ def split_commands(cmd: str) -> list[str]:
             out.append("".join(cur))
             cur = []
             i += 1
-        elif c in ";|\n`" or (c == "&" and cmd[i - 1:i] not in ("<", ">")
-                                and cmd[i + 1:i + 2] != ">"):
+        elif (c in ";\n`" or (c == "|" and cmd[i - 1:i] != ">")
+              or (c == "&" and cmd[i - 1:i] not in ("<", ">") and cmd[i + 1:i + 2] != ">")):
             out.append("".join(cur))
             cur = []
         else:
@@ -187,8 +202,14 @@ def segments(command: str, cwd: Path):
             if toks[0] == "cd" and len(toks) > 1:
                 here[0] = (here[0] / os.path.expanduser(toks[1])).resolve()
                 continue
-            if base(toks[0]) in SHELLS and "-c" in toks[:-1]:
-                yield from walk(toks[toks.index("-c") + 1])
+            if base(toks[0]) in SHELLS:
+                flag = next((i for i, t in enumerate(toks[1:-1], 1)
+                             if re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", t)), None)
+                if flag is not None:
+                    yield from walk(toks[flag + 1])
+                    continue
+            if toks[0] == "eval" and len(toks) > 1:
+                yield from walk(" ".join(toks[1:]))
                 continue
             yield here[0], toks, raw
 
@@ -257,9 +278,30 @@ def _dest(dest: str, srcs: list[str], here: Path) -> list[str]:
     return [dest]
 
 
+def _target_dir(toks: list[str]) -> tuple[str | None, list[str]]:
+    """(-t DIR | --target-directory=DIR) and the remaining operands."""
+    out, tdir, i = [], None, 1
+    while i < len(toks):
+        t = toks[i]
+        if t in ("-t", "--target-directory") and i + 1 < len(toks):
+            tdir, i = toks[i + 1], i + 2
+            continue
+        if t.startswith("--target-directory="):
+            tdir = t.split("=", 1)[1]
+        elif t and not t.startswith("-"):
+            out.append(t)
+        i += 1
+    return tdir, out
+
+
 def write_targets(toks: list[str], raw: str, here: Path) -> list[str]:
     targets = redirect_targets(raw)
     cmd, args = base(toks[0]), [t for t in toks[1:] if not t.startswith("-") and t]
+    if cmd in ALL_ARGS | DEST_ARG:
+        tdir, ops = _target_dir(toks)
+        if tdir:
+            return targets + (ops if cmd == "mv" else []) + [
+                str(Path(tdir) / os.path.basename(o.rstrip("/"))) for o in ops]
     if cmd in ALL_ARGS:
         targets += args
         if cmd == "mv" and len(args) > 1:
@@ -272,7 +314,9 @@ def write_targets(toks: list[str], raw: str, here: Path) -> list[str]:
         targets.append(".")
     elif cmd == "git":
         _, sub, gargs = parse_git(here, toks)
-        if sub == "apply":
+        hard_reset = sub == "reset" and any(f in gargs for f in ("--hard", "--merge", "--keep"))
+        stash_out = sub == "stash" and gargs[:1] in (["pop"], ["apply"])
+        if sub == "apply" or sub in GIT_TREE_REWRITES or hard_reset or stash_out:
             targets.append(".")
         elif sub in GIT_PATH_SUBS:
             if "--" in gargs:
@@ -297,6 +341,10 @@ def path_block(path: Path) -> str | None:
     if in_sdlc and rel.name == "state.json":
         return (f"{rel} records approvals and is written only by `sdlc.py approve`. "
                 f"Approvals come from the user, never from editing state.")
+    held = [f for f in (root / sdlc.SDLC_DIR).glob("*/state.json") if path in f.parents]
+    if held:
+        return (f"{rel} holds SDLC feature state ({held[0].parent.name}); deleting, moving or "
+                f"replacing it would bypass the gates. Only sdlc.py manages feature folders.")
     feat = sdlc.active_feature(root)
     if not feat or in_sdlc:
         return None
@@ -310,13 +358,18 @@ def path_block(path: Path) -> str | None:
     return None
 
 
-def gate_bash(command: str, cwd: Path) -> None:
+def gate_bash(command: str, cwd: Path, depth: int = 0) -> None:
     allow_push = os.environ.get("SDLC_ALLOW_PUSH", "").lower() in ("1", "true", "yes")
     text = strip_heredocs(command)
     found = {m.group(1) for m in ANY_GIT.finditer(text)}
     if not allow_push and "push" in found:
         block("`git push` refused — the SDLC never pushes. Tell the user the branch is "
               "ready and give them the exact push command to run themselves.")
+    if found and HOOK_EVASION.search(text) or re.search(r"\bunset\b[^;&|\n]*\bGIT_CONFIG", text):
+        block("refused: this command would skip or override the SDLC git hooks "
+              "(--no-verify, core.hooksPath, GIT_CONFIG_*).")
+    if GH_API_PUBLISH.search(text) and not allow_push:
+        block("`gh api` on pulls/merges refused — the SDLC never publishes or merges.")
     gh = ANY_GH_PR.search(text)
     if gh and not allow_push:
         block(f"`gh pr {gh.group(1)}` refused — the SDLC never publishes or merges. "
@@ -331,6 +384,11 @@ def gate_bash(command: str, cwd: Path) -> None:
                 block(f"`gh pr {rest[i + 1]}` refused — the SDLC never publishes or merges.")
         if base(toks[0]) == "git":
             d, sub, args = parse_git(here, toks)
+            if sub and sub not in GIT_SUBCOMMANDS and depth < 3:
+                alias = sdlc.git(d, "config", "--get", f"alias.{sub}")
+                if alias:
+                    expanded = alias[1:] if alias.startswith("!") else f"git {alias}"
+                    gate_bash(expanded + " " + " ".join(shlex.quote(a) for a in args), d, depth + 1)
             parsed.add(sub)
             root = sdlc.repo_root(d)
             if sub == "push" and not allow_push:
@@ -371,9 +429,11 @@ def gate_bash(command: str, cwd: Path) -> None:
 def main() -> None:
     if os.environ.get("SDLC_GATES", "").lower() in ("off", "0", "false"):
         return
+    global _RAW
+    _RAW = sys.stdin.read()
     try:
-        event = json.load(sys.stdin)
-    except (json.JSONDecodeError, ValueError):
+        event = json.loads(_RAW)
+    except ValueError:
         return
     tool = event.get("tool_name", "")
     inp = event.get("tool_input") or {}
@@ -393,6 +453,15 @@ if __name__ == "__main__":
         main()
     except SystemExit:
         raise
-    except Exception as e:  # never wedge the session on a gate bug
+    except Exception as e:
+        # Fail closed only where it matters: a command that commits, pushes, merges
+        # or opens a PR. Anything else is allowed so a gate bug can't wedge the session.
+        try:
+            cmd = (json.loads(_RAW or "{}").get("tool_input") or {}).get("command", "")
+        except ValueError:
+            cmd = ""
+        if ANY_GIT.search(cmd) or ANY_GH_PR.search(cmd) or GH_API_PUBLISH.search(cmd):
+            print(f"SDLC gate: internal error on a git/gh command, refusing to be safe: {e}", file=sys.stderr)
+            sys.exit(2)
         print(f"sdlc gate internal error (allowing): {e}", file=sys.stderr)
         sys.exit(0)
