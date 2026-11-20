@@ -1,0 +1,10 @@
+schema_version: "1.1"
+name: quick-task-asks-first
+tags: [guardrail, quick]
+runs: 1
+context:
+  scaffold_script: fixture.sh
+execution:
+  max_turns: 15
+  timeout_seconds: 600
+  allowed_tools: [Read, Glob, Grep, Bash, Edit, Skill, AskUserQuestion]

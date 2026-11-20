@@ -1,0 +1,10 @@
+schema_version: "1.1"
+name: build-delegates
+tags: [build, cost]
+runs: 1
+context:
+  scaffold_script: fixture.sh
+execution:
+  max_turns: 60
+  timeout_seconds: 600
+  allowed_tools: [Read, Glob, Grep, Bash, Write, Edit, Skill, Agent]
