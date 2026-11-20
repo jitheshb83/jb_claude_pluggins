@@ -57,6 +57,7 @@ HOOK_OFF = re.compile(
     r"|\b(?:unset|export)\b[^;&|\n]*\b(?:CLAUDECODE|SDLC_[A-Z_]+|GIT_CONFIG_\w+)\b"
     r"|(?<![\w.-])env\s+(?:\S+\s+)*?(?:-i\b|--ignore-environment|-u\s*(?:CLAUDECODE|SDLC_)|--unset)",
     re.I)
+CLEANS_UNTRACKED = re.compile(GIT + GIT_OPTS + r"\s+(?:clean\b|stash\b[^;&|\n]*\s(?:-u|--include-untracked|-a|--all)\b)")
 COMMIT_ALL = re.compile(r"\bcommit\b[^;&|\n]*\s(?:-[A-Za-z]*a[A-Za-z]*|--all)(?:\s|$)")
 
 
@@ -103,6 +104,8 @@ def mask_quotes(text: str) -> str:
 
 def path_block(path: Path) -> str | None:
     """Why an Edit/Write to `path` must be refused, or None."""
+    if ".git" in path.parts and path.name.startswith("sdlc-"):
+        return f"{path.name} is SDLC gate state in the git dir; only sdlc.py writes it."
     root = sdlc.repo_root(path)
     if not root:
         return None
@@ -115,6 +118,9 @@ def path_block(path: Path) -> str | None:
         return (f"{rel} records approvals and is written only by `sdlc.py approve`. "
                 f"Approvals come from the user, never from editing state.")
     feat = sdlc.active_feature(root)
+    if feat and in_sdlc and rel.name.casefold() in ("plan.md", "spec.md") \
+            and sdlc.approval_valid(feat, "spec") and sdlc.approval_valid(feat, "plan"):
+        sdlc.save_baseline(root, feat, approved=False)  # editing re-opens the gate: build work isn't drift
     if not feat or in_sdlc:
         return None
     return approval_block(root, feat, f"code edits ({rel})")
@@ -134,7 +140,7 @@ def approval_block(root: Path, feat: dict, what: str) -> str | None:
     stale = " (it was approved, but the file changed since — re-approve it)" \
         if feat.get("approvals", {}).get(ph) else ""
     return (f"'{feat['title']}' is still in the {ph} phase{stale}. No {what} until the user "
-            f"approves {where}/plan.md — run the sdlc-{ph} skill.")
+            f"approves {where}/{sdlc.ARTIFACT.get(ph, 'plan.md')} — run the sdlc-{ph} skill.")
 
 
 def gate_bash(command: str, cwd: Path) -> None:
@@ -158,6 +164,13 @@ def gate_bash(command: str, cwd: Path) -> None:
                   f"merges PRs. Hand the user the PR body file and the command.")
 
     root = sdlc.repo_root(cwd)
+    if root and CLEANS_UNTRACKED.search(scan):
+        untracked = sdlc.git(root, "ls-files", "--others", "--exclude-standard", "--", str(sdlc.SDLC_DIR))
+        if untracked:
+            block(f"refused: this would delete uncommitted SDLC docs ({untracked.splitlines()[0]}). "
+                  f"Commit docs/sdlc first.")
+    if re.search(GIT + r"\s+-C\b", scan):
+        root = None  # another repo: its own git hooks check the commit
     if root and "commit" in found:
         feat = sdlc.active_feature(root)
         reason = sdlc.check_branch(root, (feat or {}).get("base"))

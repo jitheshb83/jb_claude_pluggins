@@ -19,20 +19,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import sdlc  # noqa: E402
 
+# Code-change verbs as an instruction: at the start, after a politeness/ask prefix,
+# or as "take/work on this task". The hint is ~50 tokens, so a broad match is cheap.
+VERBS = (r"(?:add|implement|build|create|write|make|fix|change|update|modify|refactor|rename|remove|"
+         r"delete|migrate|port|support|develop|extend|improve|optimi[sz]e|rewrite|replace|upgrade|ship|plan)")
 DEV_INTENT = re.compile(
-    r"(?:\A\s*(?:please\s+)?(?:implement|develop|refactor|build)\b)|\b("
-    r"(?:please|can you|could you|let'?s|i want to|we need to|need to|help me)\s+"
-    r"(?:implement|develop|refactor|build)\b|"
-    r"(?:implement|develop|refactor)\s+(?:a|an|the|this|that|my|our|new|support|it)\b|"
-    r"build (?:a|an|the|me|out)\b|"
-    r"add (?:a |an |the |support |new )?(?:feature|option|command|endpoint|screen|test|skill|agent|hook|flag|setting)s?|"
-    r"fix(?:es|ing)? (?:the |a |this |that )?(?:bug|issue|crash|error|failing|regression|test)|"
-    r"(?:take|pick)(?: up| on)? (?:this|the|a|my|next) (?:task|ticket|issue|story)|"
-    r"work on (?:this|the|a|issue|ticket|task)|"
-    r"(?:write|create|make) (?:a |an |the )?(?:script|module|function|class|app|plugin|skill|agent|cli|tool|feature|api)\b|"
-    r"migrat(?:e|ion) (?:the |to )|"
-    r"ship (?:it|this|the)"
-    r")",
+    r"(?:\A\s*|(?:please|pls|can you|could you|would you|let'?s|i want to|i'd like to|we need to|"
+    r"need to|help me|go ahead and)\s+)" + VERBS + r"\b"
+    r"|\b(?:take|pick)(?: up| on)? (?:this|the|a|my|next) (?:task|ticket|issue|story)"
+    r"|\bwork on (?:this|the|a|issue|ticket|task)",
     re.IGNORECASE,
 )
 QUESTION_ONLY = re.compile(r"^\s*(what|why|how does|how do|explain|can you explain|is there|does)\b", re.I)
@@ -43,6 +38,9 @@ def message(prompt: str, cwd: Path) -> str | None:
         return None  # slash commands route themselves
     root = sdlc.repo_root(cwd)
     feat = sdlc.active_feature(root) if root else None
+    if feat and (feat.get("_corrupt") or feat.get("_missing")):
+        return (f"[jb-sdlc] SDLC state for '{feat['title']}' is unreadable or missing; code changes "
+                f"are blocked. Tell the user to fix or restore {feat['_dir'].name} — don't continue it.")
     if feat:
         return (f"[jb-sdlc] Branch '{feat['branch']}' has an active SDLC feature "
                 f"\"{feat['title']}\" ({feat.get('track', 'full')} track), phase: "

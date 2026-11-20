@@ -18,12 +18,14 @@ from pathlib import Path
 HOOKS = Path(__file__).resolve().parent.parent / "githooks"
 
 SNIPPET = """\
-if [ -z "${{SDLC_GITHOOKS:-}}" ] && [ "${{SDLC_GATES:-on}}" != off ]; then
+case "$(printf %s "${{SDLC_GATES:-on}}" | tr '[:upper:]' '[:lower:]')" in off|0|false) _sdlc_off=1 ;; *) _sdlc_off= ;; esac
+if [ -z "${{SDLC_GITHOOKS:-}}" ] && [ -z "$_sdlc_off" ]; then
   _sdlc_n=${{GIT_CONFIG_COUNT:-0}}
   export "GIT_CONFIG_KEY_${{_sdlc_n}}=core.hooksPath" "GIT_CONFIG_VALUE_${{_sdlc_n}}="{hooks}
   export GIT_CONFIG_COUNT=$((_sdlc_n + 1)) SDLC_GITHOOKS={hooks}
   unset _sdlc_n
 fi
+unset _sdlc_off
 """
 
 
@@ -32,8 +34,11 @@ def main() -> None:
     if not env_file or os.environ.get("SDLC_GATES", "").lower() in ("off", "0", "false"):
         return
     for f in HOOKS.iterdir():  # plugin copies can lose the exec bit; git silently skips such hooks
-        if f.is_file():
-            f.chmod(f.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        try:
+            if f.is_file() and not os.access(f, os.X_OK):
+                f.chmod(f.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        except OSError as e:
+            print(f"jb-sdlc: can't make {f.name} executable ({e}); git will skip it", file=sys.stderr)
     with open(env_file, "a") as fh:
         fh.write(SNIPPET.format(hooks=shlex.quote(str(HOOKS))))
 

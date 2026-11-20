@@ -13,7 +13,9 @@ CLI = PLUGIN / "scripts" / "sdlc.py"
 GATE = PLUGIN / "hooks" / "gate.py"
 ENV = {**os.environ, "SDLC_NO_GH": "1", "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"}
-ENV.pop("SDLC_GATES", None)
+for _k in [k for k in ENV if k.startswith(("SDLC_", "GIT_CONFIG_")) or k in ("CLAUDECODE", "GIT_CONFIG_COUNT")]:
+    ENV.pop(_k)  # tests must not inherit a plugin-enabled session's hooks
+ENV["SDLC_NO_GH"] = "1"
 DIAG = '\n```mermaid\nflowchart LR\n    A["parse(x)"]:::new --> B\n    classDef new fill:#DCFCE7\n```\n'
 GOOD_SPEC = ("# Spec\n## Problem\n- totals double count\n## User flow\n" + DIAG +
              "## Evidence\n- app.py:1 sets x = 1\n## Acceptance criteria\n- AC1: given x, then y\n"
@@ -1068,7 +1070,102 @@ class TestV2Layers(Repo):
         self.assertEqual(self.status()["phase"], "plan")  # trusted: it's the committed version
 
     def test_gate_is_small(self):
-        self.assertLess(len(GATE.read_text().splitlines()), 220)
+        self.assertLess(len(GATE.read_text().splitlines()), 260)
+
+
+class TestFinalReview(Repo):
+    """One-pass final review (v2), batch-fixed."""
+
+    def blocked(self, cmd):
+        return gate(self.repo, "Bash", {"command": cmd}).returncode == 2
+
+    def test_commits_that_skip_pre_commit_are_checked_by_git(self):  # 1
+        env = claude_env()
+        cli(self.repo, "new", "Unapproved")
+        sh(self.repo, "git", "add", "-A")
+        run(self.repo, "git", "commit", "-qm", "docs", env=env)
+        sh(self.repo, "git", "checkout", "-qb", "donor")  # descends from the feature tip
+        (self.repo / "donor.py").write_text("d = 1\n")
+        sh(self.repo, "git", "add", ".")
+        sh(self.repo, "git", "commit", "-qm", "donor")
+        pick = sh(self.repo, "git", "rev-parse", "HEAD").stdout.strip()
+        sh(self.repo, "git", "checkout", "-q", "feature/unapproved")
+        for args in (["git", "cherry-pick", pick], ["git", "merge", "--ff-only", "donor"]):
+            r = run(self.repo, *args, env=env)
+            self.assertNotEqual(r.returncode, 0, args)
+            self.assertIn("no approved plan", r.stderr, args)
+            run(self.repo, "git", "cherry-pick", "--abort", env=env)
+        (self.repo / "app.py").write_text("x = 7\n")
+        r = run(self.repo, "git", "commit", "-qam", "skip hooks", "-n", env=env)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_clean_refused_while_feature_docs_are_uncommitted(self):  # 2
+        cli(self.repo, "new", "Docs")
+        for cmd in ("git clean -fd", "git stash -u", "git stash push --include-untracked"):
+            self.assertTrue(self.blocked(cmd), cmd)
+        sh(self.repo, "git", "add", "-A")
+        sh(self.repo, "git", "commit", "-qm", "docs")
+        self.assertFalse(self.blocked("git clean -fd"))
+
+    def test_unrelated_branch_does_not_inherit_a_feature(self):  # 3, 4
+        cli(self.repo, "new", "A")  # feature/a at main's tip, no commits yet
+        sh(self.repo, "git", "checkout", "-q", "main")
+        sh(self.repo, "git", "checkout", "-qb", "fix/typo")
+        self.assertEqual(gate(self.repo, "Edit", {"file_path": str(self.repo / "app.py")}).returncode, 0)
+        out = json.loads(cli(self.repo, "new", "Typo").stdout)
+        self.assertEqual(out["branch"], "fix/typo")
+
+    def test_detached_head_inside_a_feature_cannot_change_it(self):  # 4
+        cli(self.repo, "new", "Det")
+        sh(self.repo, "git", "add", "-A")
+        sh(self.repo, "git", "commit", "-qm", "docs")
+        sh(self.repo, "git", "checkout", "-q", "--detach")
+        self.assertEqual(gate(self.repo, "Edit", {"file_path": str(self.repo / "app.py")}).returncode, 2)
+        self.assertIn("check it out", cli(self.repo, "abandon", "--note", "x", check=False).stderr)
+
+    def test_branch_from_merged_remote_branch_is_stale(self):  # 6
+        sh(self.repo, "git", "checkout", "-qb", "feature/r")
+        (self.repo / "app.py").write_text("x = 3\n")
+        sh(self.repo, "git", "commit", "-qam", "r")
+        sh(self.repo, "git", "push", "-qu", "origin", "feature/r")
+        sh(self.repo, "git", "push", "-q", "origin", "feature/r:main")  # merged, branch kept
+        sh(self.repo, "git", "checkout", "-q", "main")
+        sh(self.repo, "git", "branch", "-qD", "feature/r")
+        sh(self.repo, "git", "fetch", "-q")
+        sh(self.repo, "git", "checkout", "-qb", "feature/r", "origin/feature/r")  # "second machine"
+        self.assertTrue(self.blocked("git commit -m more"))
+
+    def test_untracked_state_without_record_is_not_trusted(self):  # 7
+        cli(self.repo, "new", "Rec")
+        d = self.feature_dir()
+        gd = self.repo / ".git"
+        (gd / "sdlc-state-hashes.json").unlink()  # e.g. lost record
+        r = gate(self.repo, "Edit", {"file_path": str(self.repo / "app.py")})
+        self.assertIn("changed outside sdlc.py", r.stderr)
+        for f in ("sdlc-registry.json", "sdlc-state-hashes.json"):
+            self.assertEqual(gate(self.repo, "Write", {"file_path": str(gd / f)}).returncode, 2, f)
+
+    def test_missing_baseline_reports_nothing(self):  # 8
+        (self.repo / "notes.txt").write_text("user's file\n")
+        cli(self.repo, "new", "NoBase")
+        for f in (self.repo / ".git").glob("sdlc-baseline-*.json"):
+            f.unlink()
+        out = subprocess.run([sys.executable, str(DRIFT)], env=ENV, capture_output=True, text=True,
+                             input=json.dumps({"tool_name": "Bash", "cwd": str(self.repo)})).stdout
+        self.assertEqual(out, "")
+
+    def test_block_message_names_the_right_artifact(self):  # 14
+        cli(self.repo, "new", "Full", "--track", "full")
+        r = gate(self.repo, "Edit", {"file_path": str(self.repo / "app.py")})
+        self.assertIn("spec.md", r.stderr)
+
+    def test_router_matches_everyday_requests(self):  # eval finding
+        for p in ("Add a `divide(a, b)` function to calc.py", "Fix the typo in the subtract docstring",
+                  "Plan (do not implement yet) adding a power function", "please rename foo to bar",
+                  "can you update the README badge"):
+            self.assertIn("sdlc skill", route(self.repo, p).stdout, p)
+        for p in ("what does this function do?", "thanks", "explain the gate", "List the developer settings"):
+            self.assertEqual(route(self.repo, p).stdout, "", p)
 
 
 class TestBranchGate(Repo):

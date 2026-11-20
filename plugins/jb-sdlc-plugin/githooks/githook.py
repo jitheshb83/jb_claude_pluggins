@@ -30,16 +30,17 @@ def enforce(name: str, root: Path, data: bytes = b"") -> None:
     if name == "pre-push" and not allow_push:
         refuse("the SDLC never pushes. The user pushes from their own terminal, or in Claude Code "
                "with `! SDLC_ALLOW_PUSH=1 git push ...`.")
+    feat = sdlc.active_feature(root)
+    bases = sdlc.BASE_BRANCHES | {sdlc.default_base(root)} | ({feat["base"]} if feat and feat.get("base") else set())
     if name == "pre-push":  # even when pushing is allowed: base branches change only via a PR
         for line in data.decode(errors="replace").splitlines():
             parts = line.split()
-            if len(parts) == 4 and parts[2].removeprefix("refs/heads/") in sdlc.BASE_BRANCHES:
+            if len(parts) == 4 and parts[2].removeprefix("refs/heads/") in bases:
                 refuse(f"pushing to '{parts[2]}' refused — base branches change only via a PR.")
     branch = sdlc.current_branch(root)
     if name == "pre-merge-commit" and (branch in sdlc.BASE_BRANCHES or branch == sdlc.default_base(root)):
         refuse(f"the SDLC never merges into '{branch}'. The user merges the PR.")
     if name == "reference-transaction":
-        bases = sdlc.BASE_BRANCHES | {sdlc.default_base(root)}
         current = f"refs/heads/{branch}" if branch else None
         for line in data.decode(errors="replace").splitlines():
             parts = line.split()
@@ -54,12 +55,21 @@ def enforce(name: str, root: Path, data: bytes = b"") -> None:
             if parts[2] == current and b not in bases and set(parts[1]) != {"0"}:
                 # Any new commit on the current branch (commit, cherry-pick, revert, am,
                 # merge, rebase): never onto a merged branch. Local evidence only, so it's fast.
-                os.environ["SDLC_NO_GH"] = "1"
-                reason = sdlc.check_branch(root)
+                os.environ["SDLC_NO_GH"] = os.environ["SDLC_NO_FETCH"] = "1"  # never block inside the lock
+                reason = sdlc.check_branch(root, (feat or {}).get("base"))
                 if reason:
                     refuse(reason)
+                # cherry-pick / am / revert / ff-merge / reset / commit -n never run pre-commit:
+                # check what the new commits change while the plan is unapproved.
+                if feat and not (sdlc.approval_valid(feat, "spec") and sdlc.approval_valid(feat, "plan")):
+                    old = parts[0] if set(parts[0]) != {"0"} else None
+                    changed = (sdlc.git(root, "diff", "--name-only", f"{old}..{parts[1]}") if old else
+                               sdlc.git(root, "show", "--name-only", "--format=", parts[1])) or ""
+                    code = [p for p in changed.splitlines() if Path(p).parts[:2] != sdlc.SDLC_DIR.parts]
+                    if code:
+                        refuse(f"'{feat['title']}' has no approved plan; refusing to move the branch "
+                               f"onto commits that change code ({', '.join(code[:3])}).")
     if name in ("pre-commit", "pre-merge-commit"):
-        feat = sdlc.active_feature(root)
         reason = sdlc.check_branch(root, (feat or {}).get("base"))
         if reason:
             refuse(reason)
