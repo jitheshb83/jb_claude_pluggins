@@ -29,17 +29,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import sdlc  # noqa: E402
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
-WRAPPERS = {"sudo", "env", "command", "nohup", "time", "exec", "builtin", "nice", "xargs"}
+# Prefix commands that run another command, with the options that take a value.
+WRAPPERS: dict[str, set[str]] = {
+    "sudo": {"-u", "-g", "-h", "-p", "-C", "-U", "-r", "-t", "-D"}, "doas": {"-u", "-C"},
+    "env": {"-u", "-C", "-S"}, "nice": {"-n"}, "ionice": {"-c", "-n", "-p"},
+    "timeout": {"-s", "-k", "--signal", "--kill-after"}, "gtimeout": {"-s", "-k"},
+    "xargs": {"-I", "-n", "-P", "-L", "-d", "-E", "-s"}, "stdbuf": set(), "taskset": set(),
+    "caffeinate": {"-t", "-w"}, "unbuffer": set(), "chronic": set(), "flock": {"-w", "-E"},
+    "command": set(), "nohup": set(), "time": set(), "exec": {"-a"}, "builtin": set(),
+}
+NUMERIC_ARG = {"timeout", "gtimeout", "nice", "taskset", "flock"}  # take a bare value
 SHELLS = {"bash", "sh", "zsh"}
-HEREDOC = re.compile(r"<<-?\s*(['\"]?)([\w.-]+)\1")
+# `<<` that opens a heredoc — not `<<<` (here-string) and not a shift inside $((...)).
+HEREDOC = re.compile(r"(?<![<])<<(?!<)-?\s*(['\"]?)([A-Za-z_][\w.-]*)\1")
 REDIRECT_OP = re.compile(r"(?:^|[^<>&\w])(?:\d?>>?|&>>?)\s*")
 # Fail-closed: anywhere in the command, quoted payloads included (bash -c '...',
 # "$(...)", timeout/nice/sudo prefixes, `&` chains). Heredoc bodies are skipped.
 GIT_OPTS = r"(?:\s+(?:-C|-c|--git-dir|--work-tree)\s+\S+|\s+-{1,2}[\w-]+(?:=\S+)?)*"
-ANY_GIT = re.compile(r"(?<![\w./-])git" + GIT_OPTS + r"\s+(push|commit|merge)\b")
-ANY_GH_PR = re.compile(r"(?<![\w./-])gh\s+pr\s+(create|merge)\b")
-ALL_ARGS = {"rm", "touch", "mkdir", "rmdir", "truncate", "tee"}
-LAST_ARG = {"cp", "mv", "install", "ln", "rsync"}
+ANY_GIT = re.compile(r"(?<![\w.-])[\"']?git[\"']?" + GIT_OPTS + r"\s+(push|commit|merge)\b")
+ANY_GH_PR = re.compile(r"(?<![\w.-])[\"']?gh[\"']?(?:\s+-{1,2}[\w-]+(?:[= ]\S+)?)*\s+pr\s+(create|merge)\b")
+GH_VALUE_OPTS = {"-R", "--repo", "--hostname"}
+ALL_ARGS = {"rm", "touch", "mkdir", "rmdir", "truncate", "tee", "mv"}
+DEST_ARG = {"cp", "install", "ln", "rsync"}
+GIT_PATH_SUBS = {"rm", "mv", "checkout", "restore"}
 
 
 def block(msg: str) -> None:
@@ -47,31 +59,52 @@ def block(msg: str) -> None:
     sys.exit(2)
 
 
+def _heredoc_start(line: str):
+    for m in HEREDOC.finditer(line):
+        before = line[:m.start()]
+        if before.count("$((") > before.count("))"):
+            continue  # arithmetic shift, e.g. $((a<<b))
+        return m
+    return None
+
+
 def strip_heredocs(cmd: str) -> str:
+    """Drop heredoc bodies (commit messages, file contents). An opener with no
+    closing delimiter isn't a heredoc, so its following lines are kept."""
     out, lines, i = [], cmd.split("\n"), 0
     while i < len(lines):
         out.append(lines[i])
-        m = HEREDOC.search(lines[i])
+        m = _heredoc_start(lines[i])
         if m:
-            i += 1
-            while i < len(lines) and lines[i].strip() != m.group(2):
-                i += 1
+            end = next((j for j in range(i + 1, len(lines)) if lines[j].strip() == m.group(2)), None)
+            if end is not None:
+                i = end
         i += 1
     return "\n".join(out)
 
 
 def mask_quotes(text: str) -> str:
     """Same length as text, with the contents of quoted strings blanked out."""
-    out, q = [], None
-    for c in text:
+    out, q, i = [], None, 0
+    while i < len(text):
+        c = text[i]
         if q:
+            if c == "\\" and q == '"' and i + 1 < len(text):
+                out.append("  ")
+                i += 2
+                continue
             out.append(c if c == q else " ")
             if c == q:
                 q = None
+        elif c == "\\" and i + 1 < len(text):
+            out.append(c + text[i + 1])  # escaped char outside quotes opens nothing
+            i += 2
+            continue
         else:
             if c in "'\"":
                 q = c
             out.append(c)
+        i += 1
     return "".join(out)
 
 
@@ -105,6 +138,37 @@ def split_commands(cmd: str) -> list[str]:
     return out
 
 
+def base(tok: str) -> str:
+    return os.path.basename(tok)
+
+
+def strip_wrappers(toks: list[str]) -> list[str]:
+    """Drop VAR=val assignments and wrapper commands (with their options and
+    values) so toks[0] is the command that actually runs."""
+    while toks:
+        if re.match(r"^\w+=", toks[0]):
+            toks = toks[1:]
+            continue
+        w = base(toks[0])
+        if w not in WRAPPERS:
+            return toks
+        toks, took_value = toks[1:], False
+        while toks:
+            t = toks[0]
+            if t == "--":
+                toks = toks[1:]
+                break
+            if t.startswith("-"):
+                toks = toks[2:] if t in WRAPPERS[w] else toks[1:]
+            elif w == "env" and "=" in t:
+                toks = toks[1:]
+            elif w in NUMERIC_ARG and not took_value and re.fullmatch(r"[\d.,x-]+[smhd]?", t):
+                toks, took_value = toks[1:], True
+            else:
+                break
+    return toks
+
+
 def segments(command: str, cwd: Path):
     """Yield (dir, tokens, raw) per simple command, following cd, subshells,
     wrappers (sudo/env/...) and `bash -c` payloads."""
@@ -117,15 +181,13 @@ def segments(command: str, cwd: Path):
                 toks = shlex.split(raw)
             except ValueError:
                 toks = raw.split()
-            while toks and (re.match(r"^\w+=", toks[0]) or toks[0] in WRAPPERS
-                            or (toks[0].startswith("-") and len(toks) > 1)):
-                toks = toks[1:]
+            toks = strip_wrappers(toks)
             if not toks:
                 continue
             if toks[0] == "cd" and len(toks) > 1:
                 here[0] = (here[0] / os.path.expanduser(toks[1])).resolve()
                 continue
-            if toks[0] in SHELLS and "-c" in toks[:-1]:
+            if base(toks[0]) in SHELLS and "-c" in toks[:-1]:
                 yield from walk(toks[toks.index("-c") + 1])
                 continue
             yield here[0], toks, raw
@@ -161,17 +223,64 @@ def redirect_targets(raw: str) -> list[str]:
     return out
 
 
-def write_targets(toks: list[str], raw: str) -> list[str]:
+def _inplace_files(cmd: str, toks: list[str]) -> list[str]:
+    """File operands of `sed -i` / `perl -i`, skipping scripts and the BSD suffix."""
+    inplace, script_given, files, i = False, False, [], 1
+    while i < len(toks):
+        t = toks[i]
+        if t in ("-e", "-f", "--expression", "--file"):
+            script_given, i = True, i + 2
+            continue
+        if t.startswith("-") and t != "-":
+            if "i" in t.lstrip("-") and (t.startswith("-i") or cmd == "perl"):
+                inplace = True
+                nxt = toks[i + 1] if i + 1 < len(toks) else None
+                if cmd != "perl" and t == "-i" and nxt is not None and (nxt == "" or nxt.startswith(".")):
+                    i += 1  # BSD sed: `-i ''` / `-i .bak`
+            if cmd == "perl" and t.endswith("e") and t != "-e":
+                script_given, i = True, i + 2  # -pie 'script'
+                continue
+            i += 1
+            continue
+        if not script_given:
+            script_given = True
+        else:
+            files.append(t)
+        i += 1
+    return files if inplace else []
+
+
+def _dest(dest: str, srcs: list[str], here: Path) -> list[str]:
+    d = (here / os.path.expanduser(dest))
+    if dest.endswith("/") or d.is_dir():
+        return [str(d / os.path.basename(s.rstrip("/"))) for s in srcs] or [dest]
+    return [dest]
+
+
+def write_targets(toks: list[str], raw: str, here: Path) -> list[str]:
     targets = redirect_targets(raw)
-    cmd, args = toks[0], [t for t in toks[1:] if not t.startswith("-")]
+    cmd, args = base(toks[0]), [t for t in toks[1:] if not t.startswith("-") and t]
     if cmd in ALL_ARGS:
         targets += args
-    elif cmd in LAST_ARG and args:
-        targets.append(args[-1])
-    elif cmd in ("sed", "gsed", "perl") and any(t.startswith("-i") or t == "-pi" for t in toks):
-        targets += args[1:] if cmd != "perl" else args[-1:]
-    elif cmd == "patch" or (cmd == "git" and len(toks) > 1 and toks[1] == "apply"):
+        if cmd == "mv" and len(args) > 1:
+            targets += _dest(args[-1], args[:-1], here)
+    elif cmd in DEST_ARG and args:
+        targets += _dest(args[-1], args[:-1], here)
+    elif cmd in ("sed", "gsed", "perl"):
+        targets += _inplace_files(cmd, toks)
+    elif cmd == "patch":
         targets.append(".")
+    elif cmd == "git":
+        _, sub, gargs = parse_git(here, toks)
+        if sub == "apply":
+            targets.append(".")
+        elif sub in GIT_PATH_SUBS:
+            if "--" in gargs:
+                targets += [t for t in gargs[gargs.index("--") + 1:] if t]
+            elif sub in ("rm", "mv"):
+                targets += [t for t in gargs if not t.startswith("-") and t]
+            else:  # checkout/restore <path>: only operands that are existing files
+                targets += [t for t in gargs if not t.startswith("-") and (here / t).is_file()]
     return targets
 
 
@@ -214,10 +323,19 @@ def gate_bash(command: str, cwd: Path) -> None:
               f"Hand the user the PR body file and the command to run themselves.")
     parsed: set[str] = set()
     for here, toks, raw in segments(command, cwd):
-        if toks[0] == "git":
+        if base(toks[0]) == "gh" and not allow_push:
+            rest, i = toks[1:], 0
+            while i < len(rest) and rest[i].startswith("-"):
+                i += 2 if rest[i] in GH_VALUE_OPTS else 1
+            if rest[i:i + 1] == ["pr"] and rest[i + 1:i + 2] in (["create"], ["merge"]):
+                block(f"`gh pr {rest[i + 1]}` refused — the SDLC never publishes or merges.")
+        if base(toks[0]) == "git":
             d, sub, args = parse_git(here, toks)
             parsed.add(sub)
             root = sdlc.repo_root(d)
+            if sub == "push" and not allow_push:
+                block("`git push` refused — the SDLC never pushes. Tell the user the branch is "
+                      "ready and give them the exact push command to run themselves.")
             if sub == "push":
                 for arg in args:
                     target = arg.split(":")[-1].lstrip("+").removeprefix("refs/heads/")
@@ -233,7 +351,7 @@ def gate_bash(command: str, cwd: Path) -> None:
                 reason = sdlc.check_branch(root, (feat or {}).get("base"))
                 if reason:
                     block(f"`git {sub}` refused — {reason}")
-        for t in write_targets(toks, raw):
+        for t in write_targets(toks, raw, here):
             reason = path_block((here / os.path.expanduser(t)).resolve())
             if reason:
                 block(f"shell write refused — {reason}")

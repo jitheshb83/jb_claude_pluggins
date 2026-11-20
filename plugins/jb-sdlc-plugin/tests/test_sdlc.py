@@ -562,6 +562,94 @@ class TestSecondReview(Repo):
             self.assertIn("sdlc skill", route(self.repo, p).stdout, p)
 
 
+class TestThirdReview(Repo):
+    """Regression tests for the third code review of PR #6 (reviewer's own repros)."""
+
+    def blocked(self, cmd, cwd=None):
+        return gate(cwd or self.repo, "Bash", {"command": cmd}).returncode == 2
+
+    def test_pushes_the_regex_missed(self):  # finding 1
+        sh(self.repo, "git", "checkout", "-qb", "feature/x")
+        for cmd in ('"git" push origin feat', 'git -c user.name="A B" push origin feat',
+                    "gh -R o/r pr create", "gh --repo o/r pr merge 3"):
+            self.assertTrue(self.blocked(cmd), cmd)
+
+    def test_absolute_path_git(self):  # finding 2
+        self.assertTrue(self.blocked("/usr/bin/git commit -m x"))  # on main
+        sh(self.repo, "git", "checkout", "-qb", "feature/x")
+        self.assertTrue(self.blocked("/opt/homebrew/bin/git push origin feat"))
+
+    def test_here_strings_and_shifts_do_not_hide_lines(self):  # finding 3
+        self.assertTrue(self.blocked("cat <<< hi\ngit commit -m x"))
+        self.assertTrue(self.blocked("echo $((a<<b))\ngit commit -m x"))
+        self.assertTrue(self.blocked("cat <<EOF\nno terminator\ngit commit -m x"))
+
+    def test_state_json_cannot_be_moved_removed_or_replaced(self):  # finding 4
+        cli(self.repo, "new", "Protect")
+        d = self.status()["dir"]
+        for cmd in (f"mv {d}/state.json /tmp/x", f"git rm -q {d}/state.json",
+                    f"cp /tmp/state.json {d}/", f"git checkout -- {d}/state.json",
+                    f"rm -f {d}/state.json"):
+            self.assertTrue(self.blocked(cmd), cmd)
+        self.assertFalse(self.blocked("git checkout main"))  # branch switch is not a write
+
+    def test_escaped_quote_does_not_hide_redirect(self):  # finding 5
+        cli(self.repo, "new", "Escapes")
+        self.assertTrue(self.blocked('echo "it\\"s" > src.py'))
+        self.assertTrue(self.blocked("echo it\\'s > src.py"))
+
+    def test_wrapped_writes_are_seen(self):  # finding 6
+        cli(self.repo, "new", "Wrapped")
+        for cmd in ("timeout 5 tee src.py", "stdbuf -o0 tee src.py", "sudo -u me touch src.py",
+                    "nice -n 5 cp /tmp/a src.py", "caffeinate -i rm app.py"):
+            self.assertTrue(self.blocked(cmd), cmd)
+
+    def test_bsd_sed_on_plan_docs_is_allowed(self):  # finding 7
+        cli(self.repo, "new", "Sed")
+        d = self.status()["dir"]
+        self.assertFalse(self.blocked(f"sed -i '' 's/a/b/' {d}/plan.md"))
+        self.assertFalse(self.blocked(f"sed -i.bak -e 's/a/b/' -e 's/c/d/' {d}/plan.md"))
+        self.assertTrue(self.blocked("sed -i '' 's/a/b/' app.py"))
+        self.assertTrue(self.blocked("perl -pi -e 's/a/b/' app.py"))
+
+    def test_gate_hook_blocks_on_timeout_and_has_budget(self):  # finding 8
+        cfg = json.loads((PLUGIN / "hooks" / "hooks.json").read_text())
+        h = cfg["hooks"]["PreToolUse"][0]["hooks"][0]
+        self.assertEqual(h["onFailure"], "block")
+        self.assertGreaterEqual(h["timeout"], 30)
+        src = CLI.read_text()
+        self.assertIn('timeout=4', src.split("def _merged_pr")[1].split("def ")[0])
+        self.assertIn('"--prune", "-q", "origin", timeout=4', src)
+
+    def test_failed_fetch_is_throttled(self):  # finding 8
+        m = load_module(CLI, "sdlc_fetch")
+        sh(self.repo, "git", "remote", "set-url", "origin", "/nonexistent/remote.git")
+        m.refresh_remote(self.repo)
+        stamp = self.repo / ".git" / "sdlc-fetch-stamp"
+        self.assertTrue(stamp.exists())
+        before = stamp.stat().st_mtime
+        m.refresh_remote(self.repo)
+        self.assertEqual(stamp.stat().st_mtime, before)
+
+    def test_lint_header_semicolon(self):  # finding 9
+        m = load_module(CLI, "sdlc_lint")
+        self.assertEqual(m.lint_mermaid("graph TD;\n  A-->B"), [])
+        self.assertEqual(m.lint_mermaid("flowchart LR;\n  A-->B"), [])
+
+    def test_evidence_and_none_are_strict(self):  # finding 10
+        cli(self.repo, "new", "Strict")
+        d = self.feature_dir()
+        (d / "plan.md").write_text(GOOD_PLAN_NODIAG.replace("app.py:1 sets x = 1", "I checked, e.g. the loader"))
+        self.assertIn("must cite", cli(self.repo, "approve", "plan", "--note", "ok", check=False).stderr)
+        (d / "plan.md").write_text(GOOD_PLAN_NODIAG.replace("None\n", "None of these are decided: should we cache?\n"))
+        self.assertIn("open question", cli(self.repo, "approve", "plan", "--note", "ok", check=False).stderr)
+        for ok in ("- src/loader/io.py:12 opens the file", "- `uv run pytest -q` -> 3 failed", "- nothing existing"):
+            (d / "plan.md").write_text(GOOD_PLAN_NODIAG.replace("- app.py:1 sets x = 1", ok))
+            r = cli(self.repo, "approve", "plan", "--note", "ok", check=False)
+            self.assertEqual(r.returncode, 0, (ok, r.stderr))
+            cli(self.repo, "reopen", "plan")
+
+
 class TestBranchGate(Repo):
     def commit(self, cmd="git commit -m wip"):
         return gate(self.repo, "Bash", {"command": cmd})

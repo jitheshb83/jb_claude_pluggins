@@ -31,7 +31,8 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/gate.py\"",
-            "timeout": 15
+            "timeout": 30,
+            "onFailure": "block"
           }
         ]
       }

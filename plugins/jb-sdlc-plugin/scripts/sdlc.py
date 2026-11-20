@@ -112,7 +112,7 @@ def _merged_pr(root: Path, branch: str) -> int | None:
         out = subprocess.run(
             ["gh", "pr", "list", "--head", branch, "--state", "all",
              "--json", "number,state,mergedAt", "--limit", "20"],
-            cwd=root, capture_output=True, text=True, timeout=8,
+            cwd=root, capture_output=True, text=True, timeout=4,
         )
         prs = json.loads(out.stdout) if out.returncode == 0 else []
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
@@ -133,13 +133,15 @@ def refresh_remote(root: Path, max_age: float = 60) -> None:
     if os.environ.get("SDLC_NO_FETCH") or not git(root, "remote", "get-url", "origin"):
         return
     gd = git(root, "rev-parse", "--git-common-dir")
-    fh = (root / gd / "FETCH_HEAD") if gd else None
+    stamp = (root / gd / "sdlc-fetch-stamp") if gd else None
     try:
-        if fh and fh.exists() and dt.datetime.now().timestamp() - fh.stat().st_mtime < max_age:
+        if stamp and stamp.exists() and dt.datetime.now().timestamp() - stamp.stat().st_mtime < max_age:
             return
+        if stamp:
+            stamp.touch()  # stamped before fetching, so a hanging remote is retried only once a minute
     except OSError:
         pass
-    git(root, "fetch", "--prune", "-q", "origin", timeout=10)
+    git(root, "fetch", "--prune", "-q", "origin", timeout=4)
 
 
 def check_branch(root: Path, base: str | None = None) -> str | None:
@@ -219,10 +221,10 @@ def lint_mermaid(block: str) -> list[str]:
     if not lines:
         return ["empty diagram"]
     head = lines[0].split()
-    kind = head[0]
+    kind = head[0].rstrip(";")
     if kind not in MERMAID_TYPES:
         return [f"unknown diagram type '{kind}'"]
-    if kind in ("flowchart", "graph") and len(head) > 1 and head[1] not in ("TB", "TD", "BT", "RL", "LR"):
+    if kind in ("flowchart", "graph") and len(head) > 1 and head[1].rstrip(";") not in ("TB", "TD", "BT", "RL", "LR"):
         errs.append(f"bad direction '{head[1]}'")
     body = lines[1:]
     ends = sum(1 for ln in body if ln.strip() == "end")
@@ -320,8 +322,13 @@ def _section(secs: dict, name: str) -> list[str] | None:
     return next((v for k, v in secs.items() if k.startswith(name)), None)
 
 
-EVIDENCE_REF = re.compile(r"[\w./-]+\.\w{1,6}(:\d+)?|`[^`]+`|nothing existing", re.I)
-NONE_LINE = re.compile(r"^(?:[-*]\s*)?(?:none|n/a)\b", re.I)
+CODE_EXT = ("py|pyi|kt|kts|java|ts|tsx|js|jsx|mjs|go|rs|swift|m|c|h|cc|cpp|hpp|cs|rb|php|sh|zsh|"
+            "md|json|yaml|yml|toml|ini|cfg|xml|plist|html|css|sql|gradle|txt|lock|spec|ui|qml")
+EVIDENCE_REF = re.compile(
+    r"(?:[\w.-]+/)+[\w.-]+(?::\d+)?"               # a path with a directory
+    r"|\b[\w-]+\.(?:" + CODE_EXT + r")\b(?::\d+)?"  # file.ext[:line]
+    r"|`[^`]+`|nothing existing", re.I)
+NONE_LINE = re.compile(r"^(?:[-*]\s*)?(?:none|n/a)\.?$", re.I)
 
 
 def check_content(state: dict, ph: str) -> list[str]:
