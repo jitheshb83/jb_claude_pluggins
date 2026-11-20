@@ -53,9 +53,9 @@ These are API list prices per million tokens (input / output), from the
 
 | Model | $ in / out | Used for |
 |---|---|---|
-| Opus (`opus`, Opus 5.5) | 4 / 20 | Sizing, spec, plan and coordination, when your session runs on `opus` (set in `settings.json`) |
-| Sonnet (`sonnet`, Sonnet 5.5) | 2 / 10 | Build (most tokens) and review |
-| Haiku (`haiku`, Haiku 5.5) | 0.10 / 0.50 | Code search for spec and plan |
+| `opus` | 4 / 20 | Sizing, spec, plan and coordination, when your session runs on `opus` (set in `settings.json`) |
+| `sonnet` | 2 / 10 | Build (most tokens) and review |
+| `haiku` | 0.10 / 0.50 | Code search for spec and plan |
 
 The levers below are listed by impact. They follow Anthropic's Claude Code
 cost guidance: Sonnet for most coding, Opus for architecture and reasoning,

@@ -49,10 +49,12 @@ REDIRECT_OP = re.compile(r"(?<![<>&=-])(?:\d?>>?|&>>?)\|?\s*")
 # Fail-closed: anywhere in the command, quoted payloads included (bash -c '...',
 # "$(...)", timeout/nice/sudo prefixes, `&` chains). Heredoc bodies are skipped.
 GIT_OPTS = r"(?:\s+(?:-C|-c|--git-dir|--work-tree)\s+\S+|\s+-{1,2}[\w-]+(?:=\S+)?)*"
-ANY_GIT = re.compile(r"(?<![\w.-])[\"']?git[\"']?" + GIT_OPTS + r"\s+(push|commit|merge)\b")
+ANY_GIT = re.compile(r"(?<![\w.-])[\"']?git[\"']?" + GIT_OPTS + r"\s+(push|commit|merge)(?![\w-])")
 ANY_GH_PR = re.compile(r"(?<![\w.-])[\"']?gh[\"']?(?:\s+-{1,2}[\w-]+(?:[= ]\S+)?)*\s+pr\s+(create|merge)\b")
 GH_VALUE_OPTS = {"-R", "--repo", "--hostname"}
-GH_API_PUBLISH = re.compile(r"(?<![\w.-])gh\b[^;&|\n]*\bapi\b[^;&|\n]*/(?:pulls|merges)\b(?![^;&|\n]*(?:-X|--method)\s*GET)")
+GH_API_PUBLISH = re.compile(
+    r"(?<![\w.-])gh\b(?=[^;&|\n]*\bapi\b)(?=[^;&|\n]*/(?:pulls|merges)\b)"
+    r"(?=[^;&|\n]*(?:(?:-X|--method)[\s=]*(?:POST|PUT|PATCH|DELETE)\b|\s(?:-f|-F|--field|--raw-field|--input)\b))", re.I)
 ENV_EVASION = re.compile(
     r"(?<![\w.-])(?:CLAUDECODE|SDLC_[A-Z_]+)=|\bunset\b[^;&|\n]*\b(?:CLAUDECODE|SDLC_)"
     r"|(?<![\w.-])env\s+(?:-\S*\s+)*-(?:i\b|-ignore-environment|u\s*(?:CLAUDECODE|SDLC_|GIT_CONFIG))")
@@ -295,7 +297,9 @@ def _inplace_files(cmd: str, toks: list[str]) -> list[str]:
         if t.startswith("-") and t != "-":
             sed_inplace = cmd != "perl" and (re.fullmatch(r"-[A-Za-z]*i.*", t)
                                              or t == "--in-place" or t.startswith("--in-place="))
-            if sed_inplace or (cmd == "perl" and "i" in t.lstrip("-")):
+            perl_inplace = cmd == "perl" and not t.startswith(("-M", "-m", "-I", "-x", "-0")) \
+                and re.fullmatch(r"-[a-zA-Z]*i.*", t)
+            if sed_inplace or perl_inplace:
                 inplace = True
                 nxt = toks[i + 1] if i + 1 < len(toks) else None
                 if cmd != "perl" and t == "-i" and nxt is not None and (nxt == "" or nxt.startswith(".")):
@@ -372,8 +376,12 @@ def write_targets(toks: list[str], raw: str, here: Path) -> list[str]:
                 targets += [TREE + str(d)] if whole else [str(d / t) for t in ops]
             elif sub in ("rm", "mv"):
                 targets += [str(d / t) for t in gargs if not t.startswith("-") and t]
-            else:  # checkout/restore <path>: only operands that are existing files
-                targets += [str(d / t) for t in gargs if not t.startswith("-") and (d / t).is_file()]
+            else:  # checkout/restore [<ref>] <path>...: operands that exist on disk are paths
+                ops = [t for t in gargs if not t.startswith("-") and t and (d / t).exists()]
+                top = sdlc.repo_root(d) or d
+                if any((d / t).resolve() == top for t in ops):
+                    targets.append(TREE + str(d))
+                targets += [str(d / t) for t in ops if (d / t).resolve() != top]
     return targets
 
 
@@ -423,7 +431,9 @@ def gate_bash(command: str, cwd: Path, depth: int = 0) -> None:
         block("`git push` refused — the SDLC never pushes. Tell the user the branch is "
               "ready and give them the exact push command to run themselves.")
     runs_git = re.search(r"(?<![\w.-])[\"']?git[\"']?(?:\s|$)", scan)
-    if runs_git and HOOK_EVASION.search(text) or re.search(r"\bunset\b[^;&|\n]*\bGIT_CONFIG", text):
+    # Per-command checks below see exact tokens; this coarse scan only matters when a
+    # command substitution hides a git call inside quotes, where segments can't reach.
+    if runs_git and scan is text and HOOK_EVASION.search(scan):
         block("refused: this command would skip or override the SDLC git hooks "
               "(--no-verify, core.hooksPath, GIT_CONFIG_*).")
     if GH_API_PUBLISH.search(scan) and not allow_push:
@@ -442,6 +452,12 @@ def gate_bash(command: str, cwd: Path, depth: int = 0) -> None:
                 block(f"`gh pr {rest[i + 1]}` refused — the SDLC never publishes or merges.")
         if base(toks[0]) == "git":
             d, sub, args = parse_git(here, toks)
+            gopts = toks[1:len(toks) - len(args) - 1]
+            overrides = [v for k, v in zip(gopts, gopts[1:]) if k == "-c" and "hookspath" in v.lower()]
+            if overrides or any(o.startswith("--config-env") for o in gopts) or "--no-verify" in args \
+                    or (sub == "commit" and any(re.fullmatch(r"-[a-zA-Z]*n[a-zA-Z]*", a) for a in args)):
+                block("refused: this command would skip or override the SDLC git hooks "
+                      "(--no-verify, -n, core.hooksPath).")
             if sub and sub not in GIT_SUBCOMMANDS and depth < 3:
                 alias = sdlc.git(d, "config", "--get", f"alias.{sub}")
                 if alias:
@@ -462,7 +478,7 @@ def gate_bash(command: str, cwd: Path, depth: int = 0) -> None:
                 if cur in sdlc.BASE_BRANCHES or cur == sdlc.default_base(root):
                     block(f"`git merge` into '{cur}' refused — the SDLC never merges into the base; "
                           f"the user merges the PR.")
-            if root and sub in ("commit", "push", "cherry-pick", "revert", "am", "merge", "pull", "rebase") \
+            if root and sub in ("commit", "push", "cherry-pick", "revert", "am", "merge") \
                     and "--abort" not in args:
                 feat = sdlc.active_feature(root)
                 reason = sdlc.check_branch(root, (feat or {}).get("base"))

@@ -380,9 +380,16 @@ def dirty_code(root: Path, store: bool = False) -> dict[str, str]:
         rel = entry[3:]
         if Path(rel).parts[:2] == SDLC_DIR.parts:
             continue
-        f = root / rel
-        args = ["hash-object", "-w", "--", rel] if store else ["hash-object", "--", rel]
-        out[rel] = (git(root, *args) or "") if f.is_file() else ""
+        out[rel] = ""
+    files = [r for r in out if (root / r).is_file()]
+    if files:
+        cmd = ["git", "-C", str(root), "hash-object", *(["-w"] if store else []), "--stdin-paths"]
+        try:
+            hashes = subprocess.run(cmd, input="\n".join(files), capture_output=True, text=True,
+                                    timeout=20).stdout.split()
+        except (OSError, subprocess.TimeoutExpired):
+            hashes = []
+        out.update(zip(files, hashes))
     return out
 
 
@@ -500,12 +507,15 @@ def _deleted_feature(root: Path, branch: str) -> dict | None:
             s = json.loads(git(root, "show", f"HEAD:{rel}") or "")
         except ValueError:
             continue
-        if _valid_state(s) and s["branch"] == branch:
-            s["_dir"], s["_missing"] = root / Path(rel).parent, True
-            if phase(s) != "done":
+        parent = str(Path(rel).parent)
+        if _valid_state(s) and s["branch"] == branch and parent not in registry(root).get("_abandoned", []):
+            s["_dir"] = root / parent
+            shipped = s.get("approvals", {}).get("ship") or s.get("abandoned")
+            if not shipped and phase(s) != "done":  # judged before marking it missing
+                s["_missing"] = True
                 return s
     rel = registry(root).get(branch)
-    if rel and not (root / rel / "state.json").exists():
+    if isinstance(rel, str) and not (root / rel / "state.json").exists():
         return {"title": Path(rel).name, "branch": branch, "approvals": {},
                 "_dir": root / rel, "_missing": True}
     return None
@@ -813,10 +823,23 @@ def cmd_abandon(a) -> None:
         sys.exit("sdlc: abandoning a feature needs --note with the user's words.")
     branch = current_branch(root)
     s = active_feature(root)
+    if not s:
+        sys.exit(f"sdlc: no active feature on '{branch}' to abandon.")
+    if s.get("_corrupt"):
+        sys.exit(f"sdlc: {s['_dir'].relative_to(root)}/state.json is unreadable; the user must fix "
+                 f"or delete it by hand — abandon can't tell which feature it was.")
     set_registry(root, branch, None)
-    if s and not s.get("_corrupt") and (s["_dir"] / "state.json").exists():
+    if s.get("_missing"):
+        reg = registry(root)
+        reg.setdefault("_abandoned", []).append(str(s["_dir"].relative_to(root)))
+        f = _registry_file(root)
+        if f:
+            f.write_text(json.dumps(reg, indent=2))
+    else:
         s["abandoned"] = {"at": now(), "note": a.note}
         save(s)
+    if active_feature(root, branch):
+        sys.exit("sdlc: abandon didn't take effect — another feature is still active on this branch.")
     print(f"abandoned the SDLC feature on '{branch}'")
 
 

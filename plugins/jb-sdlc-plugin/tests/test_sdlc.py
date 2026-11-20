@@ -1026,6 +1026,97 @@ class TestSixthReview(Repo):
         self.assertIn("SDLC_ALLOW_PUSH=1", (PLUGIN / "skills" / "sdlc-ship" / "SKILL.md").read_text())
 
 
+class TestSeventhReview(Repo):
+    def blocked(self, cmd):
+        return gate(self.repo, "Bash", {"command": cmd}).returncode == 2
+
+    def test_pull_is_allowed_for_recovery(self):  # finding 1
+        self.assertFalse(self.blocked("git checkout main && git pull"))
+        self.assertFalse(self.blocked("git pull --ff-only"))
+
+    def test_plumbing_is_not_commit_or_merge(self):  # finding 2
+        for cmd in ("git merge-base main HEAD", "git merge-tree a b", "git commit-tree HEAD^{tree} -m x",
+                    "git commit-graph write"):
+            self.assertFalse(self.blocked(cmd), cmd)  # on main
+        self.assertTrue(self.blocked("git commit -m x"))
+
+    def test_done_feature_with_deleted_folder_does_not_block(self):  # finding 3
+        cli(self.repo, "new", "Shipped")
+        d = self.feature_dir()
+        (d / "plan.md").write_text(GOOD_PLAN_NODIAG)
+        cli(self.repo, "approve", "plan", "--note", "yes")
+        cli(self.repo, "approve", "build", "--evidence", "ok")
+        (d / "review.md").write_text("# Review\n## Verdict: PASS\n")
+        cli(self.repo, "approve", "review")
+        (d / "pr.md").write_text("PR\n")
+        cli(self.repo, "approve", "ship")
+        sh(self.repo, "git", "add", "-A")
+        sh(self.repo, "git", "commit", "-qm", "shipped")
+        import shutil
+        shutil.rmtree(d)
+        self.assertEqual(gate(self.repo, "Edit", {"file_path": str(self.repo / "app.py")}).returncode, 0)
+
+    def test_checkout_of_directories_from_another_ref(self):  # finding 4
+        sh(self.repo, "git", "branch", "other")
+        cli(self.repo, "new", "DirCheckout")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "a.py").write_text("a = 1\n")
+        for cmd in ("git checkout other src/", "git restore --source=other src/", "git checkout other docs/sdlc/",
+                    "git checkout other src/a.py"):
+            self.assertTrue(self.blocked(cmd), cmd)
+        self.assertFalse(self.blocked("git checkout other"))  # branch switch
+
+    def test_quoted_hook_words_are_data(self):  # finding 5
+        sh(self.repo, "git", "checkout", "-qb", "feature/x")
+        for cmd in ('git commit -m "mention core.hooksPath fix"', "git log --grep=--no-verify",
+                    "git log --grep='GIT_CONFIG_COUNT'"):
+            self.assertFalse(self.blocked(cmd), cmd)
+        for cmd in ('git -c "core.hooksPath=/dev/null" commit -m x', "git commit -n -m x",
+                    "git commit -an -m x", 'git commit "--no-verify" -m x'):
+            self.assertTrue(self.blocked(cmd), cmd)
+
+    def test_abandon_reports_truthfully(self):  # finding 6
+        cli(self.repo, "new", "Gone")
+        d = self.feature_dir()
+        sh(self.repo, "git", "add", "-A")
+        sh(self.repo, "git", "commit", "-qm", "docs")
+        import shutil
+        shutil.rmtree(d)
+        cli(self.repo, "abandon", "--note", "user: drop it")
+        self.assertEqual(gate(self.repo, "Edit", {"file_path": str(self.repo / "app.py")}).returncode, 0)
+        cli(self.repo, "new", "Broken")
+        (self.feature_dir() / "state.json").write_text("{nope")
+        self.assertIn("unreadable", cli(self.repo, "abandon", "--note", "x", check=False).stderr)
+
+    def test_perl_module_flags_are_read_only(self):  # finding 7
+        cli(self.repo, "new", "Perl")
+        self.assertFalse(self.blocked("perl -MList::Util=sum -ne 'print' app.py"))
+        self.assertFalse(self.blocked("perl -Mstrict -lane 'print' app.py"))
+        self.assertTrue(self.blocked("perl -pi -e 's/a/b/' app.py"))
+        self.assertTrue(self.blocked("perl -i.bak -pe 's/a/b/' app.py"))
+
+    def test_many_untracked_files_hash_in_one_process(self):  # finding 8
+        m = load_module(CLI, "sdlc_many")
+        for i in range(300):
+            (self.repo / f"gen_{i}.txt").write_text(str(i))
+        import time
+        t = time.time()
+        dirty = m.dirty_code(self.repo)
+        self.assertEqual(len(dirty), 300)
+        self.assertTrue(all(len(h) == 40 for h in dirty.values()))
+        self.assertLess(time.time() - t, 5)
+
+    def test_gh_api_reads_are_allowed(self):  # finding 9
+        sh(self.repo, "git", "checkout", "-qb", "feature/x")
+        self.assertFalse(self.blocked("gh api repos/o/r/pulls/3/comments"))
+        self.assertFalse(self.blocked("gh api repos/o/r/pulls --paginate"))
+        self.assertTrue(self.blocked("gh api repos/o/r/pulls -f title=x -f head=b"))
+        self.assertTrue(self.blocked("gh api --method PUT repos/o/r/pulls/3/merge"))
+
+    def test_readme_names_aliases_not_versions(self):  # finding 10
+        self.assertNotRegex((PLUGIN / "README.md").read_text(), r"(?:Opus|Sonnet|Haiku) \d")
+
+
 class TestBranchGate(Repo):
     def commit(self, cmd="git commit -m wip"):
         return gate(self.repo, "Bash", {"command": cmd})
