@@ -49,6 +49,19 @@ lanes.
   synthetic numbers, never real balances, IBANs or loan figures.
 - Keep tool output small. Use quiet test flags, `tail`, and targeted `grep`
   instead of whole-file dumps of logs.
+- **Write lean code, because output tokens are the expensive kind.**
+  - Comment only the non-obvious *why*: a constraint, a workaround, an issue
+    link.
+  - Never narrate code (`# increment counter`, `// call the API`). No banner
+    comments and no commented-out code.
+  - Skip docstrings on private or trivial functions unless the repo's
+    convention requires them, and match the density of the file you're in.
+  - Test names carry the intent, so don't comment the tests.
+  - Edit existing files with minimal diffs and keep Write for new files.
+    Don't re-read a file you just edited.
+- If the `lean` hook flags an edit, apply the hint going forward. Rework
+  only an egregious case, such as a block of commented-out code.
+- No commentary between tool calls. The return block is your only prose.
 
 ## Return (and nothing else)
 

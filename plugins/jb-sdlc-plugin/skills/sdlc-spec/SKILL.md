@@ -21,8 +21,17 @@ features skip this phase, because their acceptance criteria live in
    sensible default, pick it and list it under *Constraints*.
 3. **Write spec.md** from the template. Every acceptance criterion must be
    checkable by a test or a scripted smoke check.
-4. **Get approval.** Show the AC list and ask whether to approve or change
-   it. Once the user approves:
+4. **Draw the user flow.** Add a Mermaid flow diagram showing the happy
+   path and the main error branch, plus a state diagram if the feature has
+   states. Follow the house style and templates in `${CLAUDE_PLUGIN_ROOT}/references/diagrams.md`: the init line,
+   classed nodes, at most 15 nodes. The diagram replaces prose rather than
+   repeating it. Then run:
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/sdlc.py" check-diagrams
+   ```
+5. **Get approval.** Show the AC list and link `spec.md`. The diagram
+   renders in VS Code's Markdown preview (with a Mermaid extension) and on
+   GitHub. Ask whether to approve or change it. Once the user approves:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/sdlc.py" approve spec --note "<user's words>"
    ```
@@ -30,11 +39,16 @@ features skip this phase, because their acceptance criteria live in
 
 ## Template
 
-```markdown
+~~~markdown
 # Spec: <title>
 
 ## Problem
 <1–3 sentences: who hurts, how, why now.>
+
+## User flow
+```mermaid
+<flowchart LR: actor -> steps -> outcome, plus the error branch (template in references/diagrams.md)>
+```
 
 ## Context
 <Existing behaviour and links to code (from the scout). Facts, not plans.>
@@ -47,7 +61,7 @@ features skip this phase, because their acceptance criteria live in
 <Platform, compatibility, privacy (real finance data stays local), defaults chosen.>
 
 ## Open questions
-```
+~~~
 
 Aim for 3–8 acceptance criteria. More than that usually means two features,
 so suggest splitting. Leave out implementation detail unless it is itself

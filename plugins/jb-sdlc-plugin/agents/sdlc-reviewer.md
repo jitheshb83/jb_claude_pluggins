@@ -26,7 +26,9 @@ suite. Never edit, commit or push.
    running the code. Run the suite once. If an AC has no proof, report it as
    an important finding.
 2. **Plan conformance.** Look for files changed that aren't in the plan, and
-   for planned changes that are missing. Unplanned scope counts as a finding
+   for planned changes that are missing. Check the plan's change-map diagram
+   against the diff too: a node marked `new` or `changed` that the diff
+   didn't touch, or a touched file missing from the diagram, is a nit. Unplanned scope counts as a finding
    even when the code is good.
 3. **Correctness at the edges.** Check error paths, empty or None inputs,
    time zones and dates, money rounding (use Decimal, not float, for currency),
@@ -39,6 +41,11 @@ suite. Never edit, commit or push.
    that can never fail.
 6. **Simplicity.** Look for speculative abstraction, dead code and drive-by
    refactors. These are nits unless they hide a bug.
+7. **Token waste in the diff.** Look for comments that restate the code,
+   banner comments, commented-out code, docstrings on trivial private
+   functions, and duplicated helpers. Report them as one grouped nit with a
+   count and 2–3 examples, not one finding per line. Raise it to important
+   only for commented-out code blocks or misleading comments.
 
 ## Output
 
@@ -50,4 +57,6 @@ Return a markdown section, ready to paste into review.md:
   label uncertain items `(unverified)`.
 - One line: `Recommended verdict: PASS` or `FAIL`, with the reason.
 
-If you find nothing, say so plainly rather than inventing nits.
+If you find nothing, say so plainly rather than inventing nits. Return only
+the tables and the verdict line: no preamble, no restating the diff, no
+closing summary.

@@ -130,6 +130,115 @@ def check_branch(root: Path, base: str | None = None) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------- diagrams
+
+MERMAID_TYPES = ("flowchart", "graph", "sequenceDiagram", "stateDiagram", "stateDiagram-v2",
+                 "erDiagram", "classDiagram", "gantt", "journey", "mindmap", "timeline", "pie",
+                 "gitGraph", "quadrantChart", "block-beta", "C4Context", "C4Container")
+_FENCE = re.compile(r"^```mermaid[^\n]*\n(.*?)^```", re.M | re.S)
+_SHAPES = [("([", "])"), ("[(", ")]"), ("((", "))"), ("{{", "}}"), ("[[", "]]"),
+           ("[/", "/]"), ("[\\", "\\]"), ("[", "]"), ("(", ")"), ("{", "}"), (">", "]")]
+_NODE = re.compile(r"(?:^|[\s;&>-])([A-Za-z_][\w-]*)(?=\(\[|\[\(|\(\(|\{\{|\[\[|\[/|\[\\\\|\[|\(|\{)")
+_BLOCK_OPEN = re.compile(r"^\s*(alt|opt|loop|par|critical|break|rect)\b")
+
+
+def mermaid_blocks(text: str) -> list[str]:
+    return _FENCE.findall(text)
+
+
+def _labels(line: str):
+    """Yield (node_id, label) for node shapes declared on a flowchart line."""
+    for m in _NODE.finditer(line):
+        rest = line[m.end():]
+        for op, cl in _SHAPES:
+            if rest.startswith(op):
+                body = rest[len(op):]
+                if body.startswith('"'):
+                    close = body.find('"', 1)
+                    yield m.group(1), body[: close + 1] if close > 0 else body
+                else:
+                    yield m.group(1), body.split(cl, 1)[0]
+                break
+
+
+def lint_mermaid(block: str) -> list[str]:
+    errs: list[str] = []
+    lines = [ln for ln in block.splitlines() if ln.strip() and not ln.strip().startswith("%%")]
+    if not lines:
+        return ["empty diagram"]
+    head = lines[0].split()
+    kind = head[0]
+    if kind not in MERMAID_TYPES:
+        return [f"unknown diagram type '{kind}'"]
+    if kind in ("flowchart", "graph") and len(head) > 1 and head[1] not in ("TB", "TD", "BT", "RL", "LR"):
+        errs.append(f"bad direction '{head[1]}'")
+    body = lines[1:]
+    ends = sum(1 for ln in body if ln.strip() == "end")
+    if kind in ("flowchart", "graph"):
+        subs = sum(1 for ln in body if ln.strip().startswith("subgraph"))
+        if subs != ends:
+            errs.append(f"{subs} subgraph vs {ends} end")
+        defined = {ln.split()[1] for ln in body if ln.strip().startswith("classDef") and len(ln.split()) > 1}
+        used = set(re.findall(r":::([\w-]+)", block))
+        for ln in body:
+            if ln.strip().startswith("class "):
+                used.update(c for c in ln.split()[-1:])
+        for c in sorted(used - defined):
+            errs.append(f"class '{c}' used but no classDef")
+        for ln in body:
+            if ln.strip().startswith(("classDef", "class ", "style ", "linkStyle", "click ")):
+                continue
+            for nid, label in _labels(ln):
+                if nid == "end":
+                    errs.append("node id 'end' breaks flowcharts; rename it")
+                if not label.startswith('"') and re.search(r'[()\[\]{}"|]', label):
+                    errs.append(f"quote the label of '{nid}': {label.strip()[:30]}")
+    elif kind == "sequenceDiagram":
+        opens = sum(1 for ln in body if _BLOCK_OPEN.match(ln))
+        if opens != ends:
+            errs.append(f"{opens} alt/opt/loop/par blocks vs {ends} end")
+    return errs
+
+
+def _mmdc(block: str) -> str | None:
+    """Full render check with mermaid-cli when it is installed locally."""
+    if not shutil.which("mmdc"):
+        return None
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:
+        src = Path(t) / "d.mmd"
+        src.write_text(block)
+        try:
+            r = subprocess.run(["mmdc", "-q", "-i", str(src), "-o", str(Path(t) / "d.svg")],
+                               capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return None if r.returncode == 0 else (r.stderr.strip().splitlines() or ["render failed"])[-1]
+
+
+def check_diagrams(path: Path, require: bool = False) -> list[str]:
+    text = path.read_text() if path.exists() else ""
+    blocks = mermaid_blocks(text)
+    errs = [] if blocks or not require else [f"{path.name}: needs at least one mermaid diagram "
+                                             f"(see references/diagrams.md)"]
+    for i, b in enumerate(blocks, 1):
+        errs += [f"{path.name} diagram {i}: {e}" for e in lint_mermaid(b)]
+        rendered = _mmdc(b) if not errs else None
+        if rendered:
+            errs.append(f"{path.name} diagram {i}: mmdc: {rendered}")
+    return errs
+
+
+def diagram_required(state: dict, ph: str) -> bool:
+    if ph == "spec":
+        return True  # spec gate exists only on the full track
+    if ph == "plan":
+        plan = state["_dir"] / "plan.md"
+        lanes = plan.exists() and re.search(r"(?m)^Lane [A-C]\b", plan.read_text())
+        return state.get("track") == "full" or bool(lanes)
+    return False
+
+
 # ------------------------------------------------------------------- state
 
 
@@ -198,6 +307,8 @@ SPEC_TEMPLATE = """# Spec: {title}
      editing it after approval re-opens the spec gate. -->
 
 ## Problem
+## User flow
+<mermaid flowchart: see references/diagrams.md>
 ## Context
 ## Acceptance criteria
 ## Non-goals
@@ -302,6 +413,9 @@ def cmd_approve(a) -> None:
         f = s["_dir"] / ARTIFACT[ph]
         if not f.exists() or not f.read_text().strip():
             sys.exit(f"sdlc: {f.relative_to(root)} is missing or empty.")
+        diagram_errs = check_diagrams(f, require=diagram_required(s, ph)) if ph in ("spec", "plan") else []
+        if diagram_errs:
+            sys.exit("sdlc: fix the diagrams first:\n  " + "\n  ".join(diagram_errs))
         if ph == "review" and not re.search(r"(?im)^[#*\s]*verdict\W*pass\b", f.read_text()):
             sys.exit("sdlc: review.md has no 'Verdict: PASS' line — fix findings first.")
         entry["sha256"] = sha(f)
@@ -344,6 +458,19 @@ def cmd_track(a) -> None:
     print(json.dumps(_status(s, root), indent=2))
 
 
+def cmd_check_diagrams(a) -> None:
+    if a.files:
+        errs = [e for f in a.files for e in check_diagrams(Path(f))]
+    else:
+        root = _root_or_die()
+        s = _feature_or_die(root)
+        errs = [e for ph in ("spec", "plan") if (s["_dir"] / ARTIFACT[ph]).exists()
+                for e in check_diagrams(s["_dir"] / ARTIFACT[ph], require=diagram_required(s, ph))]
+    if errs:
+        sys.exit("DIAGRAMS:\n  " + "\n  ".join(errs))
+    print("OK: diagrams lint clean" + ("" if shutil.which("mmdc") else " (mmdc not installed: syntax lint only)"))
+
+
 def cmd_check_branch(a) -> None:
     root = _root_or_die()
     s = active_feature(root)
@@ -372,11 +499,13 @@ def main(argv: list[str] | None = None) -> None:
     ro = sub.add_parser("reopen", help="clear a gate and every later one")
     ro.add_argument("phase", choices=PHASES)
     ro.add_argument("--note")
+    cd = sub.add_parser("check-diagrams", help="lint mermaid diagrams (active spec/plan, or given files)")
+    cd.add_argument("files", nargs="*")
     cb = sub.add_parser("check-branch", help="exit non-zero if this branch is stale/base")
     cb.add_argument("--base")
     a = p.parse_args(argv)
     {"new": cmd_new, "status": cmd_status, "approve": cmd_approve,
-     "reopen": cmd_reopen, "track": cmd_track, "check-branch": cmd_check_branch}[a.cmd](a)
+     "reopen": cmd_reopen, "track": cmd_track, "check-diagrams": cmd_check_diagrams, "check-branch": cmd_check_branch}[a.cmd](a)
 
 
 if __name__ == "__main__":

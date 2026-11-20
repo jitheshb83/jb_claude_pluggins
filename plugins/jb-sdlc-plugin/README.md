@@ -4,16 +4,23 @@ A lean, gated, cost-aware AI SDLC for Claude Code that works in any git repo.
 Unlike the other plugins in this marketplace, it doesn't depend on
 `jb_gateway_mcp`.
 
-```
-"implement X" / "fix this bug" / "take this task" / /sdlc
-        │  (router hook points every dev prompt here)
-        ▼
-  size it ── quick ──▶ just do it (tests + fresh-branch gate still apply)
-        │
-        ├─ lite ──▶ plan(+ACs) ─▶ build ─▶ review ─▶ ship
-        └─ full ──▶ spec ─▶ plan ─▶ build ─▶ review(+code-review) ─▶ ship
-                    user     user   tests    Verdict:   user OKs
-                    approves approves green  PASS       push + PR
+```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontFamily": "ui-sans-serif, system-ui", "lineColor": "#64748B"}}}%%
+flowchart LR
+    P(["implement X / fix bug / take task"]):::actor --> R["router hook"]:::changed
+    R --> Z{"size it"}:::risk
+    Z -- quick --> Q["just do it"]:::external
+    Z -- lite --> PL["plan + ACs"]:::new
+    Z -- full --> SP["spec"]:::new --> PL
+    PL -- "you approve" --> B["build on Sonnet<br/>parallel lanes"]:::new
+    B -- "tests green" --> RV["review<br/>Verdict: PASS"]:::test
+    RV --> SH["ship: PR"]:::new
+    classDef new fill:#DCFCE7,stroke:#16A34A,color:#14532D,stroke-width:2px
+    classDef changed fill:#DBEAFE,stroke:#2563EB,color:#1E3A8A,stroke-width:2px
+    classDef external fill:#F3F4F6,stroke:#6B7280,color:#111827,stroke-dasharray:4 3
+    classDef risk fill:#FEF3C7,stroke:#D97706,color:#78350F,stroke-width:2px
+    classDef test fill:#F3E8FF,stroke:#9333EA,color:#581C87
+    classDef actor fill:#FFE4E6,stroke:#E11D48,color:#881337,stroke-width:2px
 ```
 
 ## Components
@@ -30,8 +37,10 @@ Unlike the other plugins in this marketplace, it doesn't depend on
 | `sdlc-builder` agent | **sonnet**, `medium` (`high` on full track), 120 turns | Test-first implementation in an isolated context. |
 | `sdlc-reviewer` agent | **sonnet**, `high`, 40 turns | Fresh-context review against the ACs and plan, tests and private-data leaks. |
 | `hooks/route.py` | UserPromptSubmit | Adds one context line pointing development prompts at `sdlc`, and announces the active feature and phase. |
+| `hooks/lean.py` | PostToolUse | Flags output-token waste as it's written: comment-heavy edits, comments that narrate code, commented-out code, and whole-file Writes that changed only a little. It sends a one-line hint back and never blocks. |
 | `hooks/gate.py` | PreToolUse | Blocks commits on main or merged branches, pushes to main, and code edits before the plan is approved. |
-| `scripts/sdlc.py` | stdlib CLI | `new`, `track`, `status`, `approve`, `reopen`, `check-branch`. |
+| `scripts/sdlc.py` | stdlib CLI | `new`, `track`, `status`, `approve`, `reopen`, `check-diagrams`, `check-branch`. |
+| `references/diagrams.md` | — | Mermaid house style (muted, semantic palette that works in light and dark themes) and templates: user flow, change map, sequence, lanes, state, ER. |
 
 ## Cost model
 
@@ -66,7 +75,8 @@ contexts.
    live in separate subagent contexts.
 6. **Make resuming cheap.** State lives on disk and the router re-announces
    the phase, so `/clear` between features costs nothing.
-7. **Cap runaway work.** `maxTurns` limits every agent, and review fixes
+7. **Don't generate what nobody reads.** Output tokens cost 5× input. Code comments carry only the non-obvious why, with no narration, banners or commented-out code. Edits are minimal diffs, not file rewrites. Chat replies don't echo code or tool output. Agents return fixed blocks. `lean.py` and the reviewer both check for this.
+8. **Cap runaway work.** `maxTurns` limits every agent, and review fixes
    re-run only the reviewer, not the whole review stack.
 
 ## Parallelism
@@ -93,6 +103,12 @@ equivalent. This plugin already routes per phase, so you don't need it.
 
 ## Artifacts
 
+The full-track `spec.md` carries a user-flow diagram. `plan.md` carries a
+change map on the full track, or when it touches 3 or more files or has
+lanes, plus a sequence or ER diagram where relevant. `approve` refuses a
+diagram that fails the lint. That lint is a built-in syntax check, plus a
+full render with `mmdc` if it is installed.
+
 ```
 docs/sdlc/2026-11-20-card-import/
   spec.md      full track only: problem, ACs, non-goals
@@ -117,6 +133,7 @@ Three switches control the hooks:
 - `SDLC_GATES=off` disables both gates.
 - `SDLC_AUTOROUTE=off` disables the router.
 - `SDLC_NO_GH=1` skips the merged-PR lookup.
+- `SDLC_LEAN=off` disables the output-token watchdog.
 
 A hook that hits an internal error allows the action.
 

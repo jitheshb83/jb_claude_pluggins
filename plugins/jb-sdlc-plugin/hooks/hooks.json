@@ -1,5 +1,5 @@
 {
-  "description": "jb-sdlc-plugin: route development prompts to the sdlc skill; gate commits/pushes on main/master or merged branches; gate code edits before the plan is approved.",
+  "description": "jb-sdlc-plugin: route development prompts to the sdlc skill; flag output-token waste (comment noise, dead code, whole-file rewrites); gate commits/pushes on main/master or merged branches; gate code edits before the plan is approved.",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -7,6 +7,18 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/route.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/lean.py\"",
             "timeout": 5
           }
         ]

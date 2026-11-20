@@ -64,7 +64,36 @@ user should `/clear` between features rather than carry a long context.
   Typing out code goes on Sonnet at medium. Use `max` only when the user
   asks.
 
-## 4. Parallelism: finish faster where work is independent
+## 4. Output discipline: don't pay for tokens nobody needs
+
+Output tokens cost 5× input on every model, and narration is pure output.
+These rules apply to you and to every subagent you brief:
+
+- **Code comments: the non-obvious *why* only.** That means a constraint, a
+  workaround, a gotcha, or a link to an issue. No comments that restate the
+  code (`# loop over accounts`), no banner or section comments, no
+  commented-out code (git keeps history), and no docstrings on private or
+  trivial functions unless the repo's convention requires them. Match the
+  surrounding file's density.
+- **Edit, don't rewrite.** Change existing files with Edit and a minimal
+  diff. Use Write only for new files. Don't re-read a file after editing it.
+- **Don't echo work back.** In chat, never paste code or diffs you just
+  wrote, restate tool output, or narrate what you're about to do. Give the
+  result, the file links and the verification status.
+- **Keep reports short.** A phase summary is 5 lines or fewer. A final
+  summary covers what changed, where, and whether it's verified, in about
+  10 lines.
+- **Artifacts are tables and bullets, not prose.** They get re-read in
+  every later phase.
+- **Subagent briefs and returns stay tight.** Give the task, the paths, and
+  the return format. Agents return their fixed block, not essays.
+
+The `lean.py` hook flags comment-heavy edits, narrating comments,
+commented-out code and whole-file rewrites as they happen. Take the hint
+for the next edits. Don't spend more tokens re-editing a file just to strip
+a couple of comments.
+
+## 5. Parallelism: finish faster where work is independent
 
 Parallel subagents cut wall-clock time, but every extra agent pays its own
 startup context. Fan out where the jobs are truly independent and big enough
@@ -100,7 +129,7 @@ branch and worktree. Each task also gets its own PR.
 Don't run tasks in parallel if they touch the same files, or if one depends
 on another. In those cases, chain them.
 
-## 5. Rules that hold in every phase
+## 6. Rules that hold in every phase
 
 - **Never approve a user gate yourself.** Run `approve spec` or `approve plan`
   only after the user says yes to that exact artifact. Ask with one

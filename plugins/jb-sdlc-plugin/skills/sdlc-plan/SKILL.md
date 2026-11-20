@@ -25,6 +25,16 @@ this phase runs at high effort. The hook blocks code edits outside
 3. **Write plan.md** from the template that fits the track. Steps must be
    small, ordered, and able to keep the suite green between them. Then
    decide the **lanes** (see below).
+   - **Diagrams**, following the house style in `${CLAUDE_PLUGIN_ROOT}/references/diagrams.md`:
+     - a **change map**, required on the full track or when the plan touches
+       3 or more files: new, changed and external nodes, with test links;
+     - a **sequence diagram** if the change crosses a process, API, MCP or
+       hook boundary;
+     - an **ER diagram** for schema changes;
+     - a **lanes** diagram if the plan has lanes.
+
+     Use at most 2 diagrams. Run `sdlc.py check-diagrams`; `approve plan`
+     refuses if a diagram fails the lint or a required one is missing.
 4. **Approval.** Show the plan, or on the lite track its Goal and
    Acceptance criteria and the Changes table, and ask whether to approve or
    change it. Once the user approves:
@@ -35,7 +45,7 @@ this phase runs at high effort. The hook blocks code edits outside
 
 ## Template (lite adds Goal and Acceptance criteria at the top)
 
-```markdown
+~~~markdown
 # Plan: <title>
 
 ## Goal                      <!-- lite only: 1–2 sentences -->
@@ -43,6 +53,10 @@ this phase runs at high effort. The hook blocks code edits outside
 
 ## Approach
 <One paragraph.>
+
+```mermaid
+<change map: flowchart TD, a subgraph per area, nodes classed new/changed/external/risk/test>
+```
 
 ## Changes
 | File | Change |
@@ -66,7 +80,7 @@ Lane B (files: <paths>):
 - <smoke check>
 
 ## Risks & rollback     <!-- full track; lite: one line or omit -->
-```
+~~~
 
 ## Verification by stack
 
