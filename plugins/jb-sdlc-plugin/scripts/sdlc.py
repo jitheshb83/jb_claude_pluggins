@@ -385,12 +385,19 @@ def dirty_code(root: Path, store: bool = False) -> dict[str, str]:
     if files:
         cmd = ["git", "-C", str(root), "hash-object", *(["-w"] if store else []), "--stdin-paths"]
         try:
-            hashes = subprocess.run(cmd, input="\n".join(files), capture_output=True, text=True,
-                                    timeout=20).stdout.split()
+            r = subprocess.run(cmd, input="\n".join(files), capture_output=True, text=True, timeout=20)
+            hashes = r.stdout.split() if r.returncode == 0 else []
         except (OSError, subprocess.TimeoutExpired):
             hashes = []
-        out.update(zip(files, hashes))
+        if len(hashes) == len(files):
+            out.update(zip(files, hashes))
+        else:  # one failed (unreadable, vanished): hash individually; UNKNOWN is never reverted
+            for f in files:
+                out[f] = git(root, "hash-object", *(["-w"] if store else []), "--", f) or UNKNOWN
     return out
+
+
+UNKNOWN = "?"  # baseline couldn't read the file: leave it out of drift and never revert it
 
 
 def save_baseline(root: Path, state: dict, approved: bool = False) -> None:
@@ -414,7 +421,9 @@ def drift(root: Path, state: dict) -> list[str]:
     if base.get("approved"):
         save_baseline(root, state, approved=False)
         return []
-    return sorted(p for p, h in dirty_code(root).items() if base["files"].get(p) != h)
+    files = base["files"]
+    return sorted(p for p, h in dirty_code(root).items()
+                  if files.get(p) != h and files.get(p) != UNKNOWN and h != UNKNOWN)
 
 
 def baseline_files(root: Path, state: dict) -> dict[str, str]:
@@ -530,7 +539,26 @@ def active_feature(root: Path, branch: str | None = None) -> dict | None:
     hits = [s for s in feats if s.get("branch") == branch and phase(s) != "done"]
     if hits:
         return max(hits, key=lambda s: s.get("created", ""))
-    return _deleted_feature(root, branch) if branch else None
+    gone = _deleted_feature(root, branch) if branch else None
+    return gone or _feature_at_head(root, branch, feats)
+
+
+def _feature_at_head(root: Path, branch: str, feats: list[dict]) -> dict | None:
+    """An open feature whose branch HEAD is on without being on it: a detached HEAD at
+    or past its tip, or a new branch created from its tip. Keeps the gate closed."""
+    if branch in BASE_BRANCHES:
+        return None
+    head = git(root, "rev-parse", "HEAD")
+    for s in feats:
+        b = s.get("branch")
+        if not b or b == branch or phase(s) == "done":
+            continue
+        tip = git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}")
+        if not tip:
+            continue
+        if tip == head or (not branch and git(root, "merge-base", "--is-ancestor", tip, "HEAD") is not None):
+            return s
+    return None
 
 
 def approval_valid(state: dict, ph: str) -> bool:
@@ -804,16 +832,21 @@ def cmd_revert_drift(a) -> None:
         if rel not in drifted:
             sys.exit(f"sdlc: {rel} isn't in the drift list — refusing to touch it.")
     for rel in a.paths:
-        f, h = root / rel, base.get(str(Path(rel)))
-        if h:  # was already dirty at the baseline: restore that exact content
+        rel = str(Path(rel))
+        f, h = root / rel, base.get(rel)
+        in_head = git(root, "cat-file", "-e", f"HEAD:{rel}") is not None
+        if h:  # already dirty at the baseline (maybe the user's): restore that exact content
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_bytes(subprocess.run(["git", "-C", str(root), "cat-file", "-p", h],
                                          capture_output=True, check=True).stdout)
-        elif h == "" or git(root, "ls-files", "--error-unmatch", "--", rel) is None:
+        elif in_head and h is None:  # clean at the baseline: back to HEAD, index included
+            git(root, "restore", "--source=HEAD", "--staged", "--worktree", "--", rel)
+        else:  # created after the baseline, or deleted at it
+            git(root, "rm", "-q", "--cached", "--ignore-unmatch", "--", rel)
             if f.is_file():
-                f.unlink()  # created after the baseline (or deleted at it)
-        else:
-            git(root, "checkout", "--", rel)
+                f.unlink()
+        if rel in drift(root, s):
+            sys.exit(f"sdlc: {rel} still differs from the baseline after reverting.")
         print(f"reverted {rel}")
 
 

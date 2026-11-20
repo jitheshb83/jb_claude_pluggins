@@ -62,6 +62,8 @@ HOOK_EVASION = re.compile(r"--no-verify\b|\bcore\.hooksPath\b|\bGIT_CONFIG_(?:CO
 ALL_ARGS = {"rm", "touch", "mkdir", "rmdir", "truncate", "tee", "mv"}
 DEST_ARG = {"cp", "install", "ln", "rsync"}
 GIT_PATH_SUBS = {"rm", "mv", "checkout", "restore"}
+WRITERS = {"rm", "touch", "mkdir", "rmdir", "truncate", "tee", "mv", "cp", "install", "ln", "rsync",
+           "sed", "gsed", "perl", "patch", "chmod", "dd"}
 GIT_TREE_REWRITES = {"cherry-pick", "am", "revert", "merge", "pull", "rebase"}  # rewrite tracked files
 GIT_SUBCOMMANDS = GIT_PATH_SUBS | GIT_TREE_REWRITES | {
     "add", "apply", "bisect", "blame", "branch", "clone", "commit", "config", "describe", "diff",
@@ -84,8 +86,9 @@ def _heredoc_start(line: str):
         before = line[:m.start()]
         if before.count("$((") > before.count("))"):
             continue  # arithmetic shift, e.g. $((a<<b))
-        if SHELL_FED.search(before):
-            continue  # `bash <<EOF`: the body runs, so keep it visible to the checks
+        if SHELL_FED.search(before) or re.search(
+                r"\|\s*(?:\S*/)?(?:bash|sh|zsh|dash|ksh|eval|xargs|source|\.)\b", line[m.end():]):
+            continue  # `bash <<EOF` / `cat <<EOF | sh`: the body runs, so keep it visible
         return m
     return None
 
@@ -168,9 +171,9 @@ def base(tok: str) -> str:
     return os.path.basename(tok)
 
 
-def strip_wrappers(toks: list[str]) -> list[str]:
+def strip_wrappers(toks: list[str], seen: set[str] | None = None) -> list[str]:
     """Drop VAR=val assignments and wrapper commands (with their options and
-    values) so toks[0] is the command that actually runs."""
+    values) so toks[0] is the command that actually runs. Wrapper names go in `seen`."""
     while toks:
         if re.match(r"^\w+=", toks[0]):
             toks = toks[1:]
@@ -178,6 +181,8 @@ def strip_wrappers(toks: list[str]) -> list[str]:
         w = base(toks[0])
         if w not in WRAPPERS:
             return toks
+        if seen is not None:
+            seen.add(w)
         toks, took_value = toks[1:], False
         while toks:
             t = toks[0]
@@ -238,7 +243,8 @@ def segments(command: str, cwd: Path):
             if env_evasion(toks):
                 block("refused: the command changes CLAUDECODE / SDLC_* / GIT_CONFIG_* in its "
                       "environment, which would switch the SDLC gates off. Only the user sets those.")
-            toks = strip_wrappers(toks)
+            seen: set[str] = set()
+            toks = strip_wrappers(toks, seen)
             if not toks:
                 continue
             if toks[0] == "cd" and len(toks) > 1:
@@ -253,6 +259,19 @@ def segments(command: str, cwd: Path):
             if toks[0] == "eval" and len(toks) > 1:
                 yield from walk(" ".join(toks[1:]))
                 continue
+            if base(toks[0]) == "find":
+                for j, t in enumerate(toks):
+                    if t in ("-exec", "-execdir", "-ok", "-okdir"):
+                        end = next((k for k in range(j + 1, len(toks)) if toks[k] in (";", "+", "\\;")),
+                                   len(toks))
+                        inner = [x for x in toks[j + 1:end] if x != "{}"]
+                        if inner:
+                            yield from walk(" ".join(shlex.quote(x) for x in inner + ["{}"]))
+                if "-delete" in toks:
+                    yield here[0], ["\0tree-writer"], raw
+                continue
+            if "xargs" in seen and base(toks[0]) in WRITERS:
+                yield here[0], ["\0tree-writer"], raw  # operands come from stdin: unknown
             yield here[0], toks, raw
 
     yield from walk(command)
@@ -341,6 +360,8 @@ def _target_dir(toks: list[str]) -> tuple[str | None, list[str]]:
 
 
 def write_targets(toks: list[str], raw: str, here: Path) -> list[str]:
+    if toks[0] == "\0tree-writer":
+        return [TREE + str(here)]
     targets = redirect_targets(raw)
     cmd, args = base(toks[0]), [t for t in toks[1:] if not t.startswith("-") and t]
     if cmd in ALL_ARGS | DEST_ARG:
@@ -407,6 +428,13 @@ def path_block(path: Path, held_check: bool = True) -> str | None:
     feat = sdlc.active_feature(root)
     if not feat or in_sdlc:
         return None
+    where = feat["_dir"].relative_to(root)
+    if feat.get("_corrupt"):
+        return (f"{where}/state.json is unreadable (merge conflict?). No code changes until the user "
+                f"fixes it by hand; tell them which file.")
+    if feat.get("_missing"):
+        return (f"the SDLC folder {where} was deleted. No code changes until the user restores it "
+                f"(`git checkout HEAD -- {where}`) or abandons the feature (`sdlc.py abandon --note`).")
     if not sdlc.approval_valid(feat, "spec") or not sdlc.approval_valid(feat, "plan"):
         ph = sdlc.phase(feat)
         stale = " (it was approved, but the file changed since — re-approve it)" \
@@ -415,6 +443,30 @@ def path_block(path: Path, held_check: bool = True) -> str | None:
                 f"({rel}) until the user approves {feat['_dir'].relative_to(root)}/plan.md — "
                 f"run the sdlc-{ph} skill.")
     return None
+
+
+VALUE_SHORTS = {"commit": "mFCctS", "merge": "mFsX", "am": "CpS", "rebase": "sXS",
+                "cherry-pick": "mXS", "revert": "mXS", "push": "o"}
+
+
+def short_flags(sub: str, args: list[str]) -> set[str]:
+    """Letters of short-flag clusters, stopping inside a cluster at a value flag
+    (`-mwarning` is -m with value 'warning', not -w -a -r -n ...)."""
+    out, takes = set(), VALUE_SHORTS.get(sub, "")
+    for a in args:
+        if a == "--":
+            break
+        if re.fullmatch(r"-[A-Za-z][^-]*", a):
+            for ch in a[1:]:
+                out.add(ch)
+                if ch in takes:
+                    break
+    return out
+
+
+def skips_hooks(sub: str, args: list[str]) -> bool:
+    long_nv = any(len(a) > 6 and "--no-verify".startswith(a.split("=")[0]) for a in args if a.startswith("--no-v"))
+    return long_nv or (sub in ("commit", "merge", "am") and "n" in short_flags(sub, args))
 
 
 def gate_bash(command: str, cwd: Path, depth: int = 0) -> None:
@@ -453,11 +505,15 @@ def gate_bash(command: str, cwd: Path, depth: int = 0) -> None:
         if base(toks[0]) == "git":
             d, sub, args = parse_git(here, toks)
             gopts = toks[1:len(toks) - len(args) - 1]
-            overrides = [v for k, v in zip(gopts, gopts[1:]) if k == "-c" and "hookspath" in v.lower()]
-            if overrides or any(o.startswith("--config-env") for o in gopts) or "--no-verify" in args \
-                    or (sub == "commit" and any(re.fullmatch(r"-[a-zA-Z]*n[a-zA-Z]*", a) for a in args)):
+            cvals = [v.lower() for k, v in zip(gopts, gopts[1:]) if k == "-c"]
+            cvals += [o[2:].lower() for o in gopts if o.startswith("-c") and len(o) > 2]
+            if any("hookspath" in v for v in cvals) or any(o.startswith("--config-env") for o in gopts) \
+                    or skips_hooks(sub, args):
                 block("refused: this command would skip or override the SDLC git hooks "
                       "(--no-verify, -n, core.hooksPath).")
+            if any(v.startswith("alias.") for v in cvals):
+                block("refused: inline `-c alias.*` definitions can't be checked. Run the real "
+                      "subcommand instead.")
             if sub and sub not in GIT_SUBCOMMANDS and depth < 3:
                 alias = sdlc.git(d, "config", "--get", f"alias.{sub}")
                 if alias:
@@ -478,6 +534,16 @@ def gate_bash(command: str, cwd: Path, depth: int = 0) -> None:
                 if cur in sdlc.BASE_BRANCHES or cur == sdlc.default_base(root):
                     block(f"`git merge` into '{cur}' refused — the SDLC never merges into the base; "
                           f"the user merges the PR.")
+            if root and sub == "commit":
+                feat = sdlc.active_feature(root)
+                if feat and not (sdlc.approval_valid(feat, "spec") and sdlc.approval_valid(feat, "plan")):
+                    staged = (sdlc.git(root, "diff", "--cached", "--name-only") or "").splitlines()
+                    if "a" in short_flags(sub, args) or "--all" in args:
+                        staged += (sdlc.git(root, "diff", "--name-only") or "").splitlines()
+                    code = [x for x in staged if Path(x).parts[:2] != sdlc.SDLC_DIR.parts]
+                    if code:
+                        block(f"`git commit` refused — '{feat['title']}' has no approved plan; it would "
+                              f"commit code ({', '.join(code[:3])}).")
             if root and sub in ("commit", "push", "cherry-pick", "revert", "am", "merge") \
                     and "--abort" not in args:
                 feat = sdlc.active_feature(root)

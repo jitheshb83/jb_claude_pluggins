@@ -45,7 +45,7 @@ def enforce(name: str, root: Path, data: bytes = b"") -> None:
             if b in bases and parts[1] not in remotes:
                 refuse(f"refusing to move '{b}' to a commit no remote has: the SDLC never changes "
                        f"the base branch, it only fast-forwards it to a remote's {b}.")
-    if name == "pre-commit":
+    if name in ("pre-commit", "pre-merge-commit"):
         feat = sdlc.active_feature(root)
         reason = sdlc.check_branch(root, (feat or {}).get("base"))
         if reason:
