@@ -16,10 +16,21 @@ features skip this phase, because their acceptance criteria live in
 1. **Ground yourself cheaply.** Read the repo's CLAUDE.md and README. To
    find the affected area, spawn `sdlc-scout`, which runs on Haiku, with the
    feature description. Don't read the codebase broadly yourself.
-2. **Resolve the load-bearing unknowns** in one `AskUserQuestion`, with
-   four questions or fewer and concrete options. For anything with a
-   sensible default, pick it and list it under *Constraints*.
-3. **Write spec.md** from the template. Every acceptance criterion must be
+   Treat the scout's map as leads, not evidence. Before citing anything as
+   fact, open the cited lines yourself.
+2. **Discuss before you write.** Give the user, briefly:
+   - your understanding of the request;
+   - what the code shows today, each item with its `path:line` or
+     `command` evidence;
+   - the questions that decide the acceptance criteria.
+
+   Ask in one `AskUserQuestion` with four questions or fewer and concrete
+   options. Don't fill gaps with assumptions. Anything you can't verify is a
+   question. A sensible default goes in as a question with that default
+   listed first, not as a silent choice.
+3. **Write spec.md** from the template. Record each answer under
+   `## Decisions` as "question → user's answer". Leave `## Open questions` as
+   `None` only when nothing is unclear. Every acceptance criterion must be
    checkable by a test or a scripted smoke check.
 4. **Draw the user flow.** Add a Mermaid flow diagram showing the happy
    path and the main error branch, plus a state diagram if the feature has
@@ -29,7 +40,9 @@ features skip this phase, because their acceptance criteria live in
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/sdlc.py" check-diagrams
    ```
-5. **Get approval.** Show the AC list and link `spec.md`. The diagram
+5. **Get approval.** `approve spec` refuses when sections are empty, when
+   Evidence cites nothing actually read or run, when an open question
+   remains, or when `--note` is missing. Show the AC list and link `spec.md`. The diagram
    renders in VS Code's Markdown preview (with a Mermaid extension) and on
    GitHub. Ask whether to approve or change it. Once the user approves:
    ```bash
@@ -51,16 +64,23 @@ features skip this phase, because their acceptance criteria live in
 ```
 
 ## Context
-<Existing behaviour and links to code (from the scout). Facts, not plans.>
+<Existing behaviour, as facts, not plans.>
+
+## Evidence
+- <path:line or `command`>: <what it shows>. One bullet per claim made above.
 
 ## Acceptance criteria
 - AC1: Given <state>, when <action>, then <observable result>.
 
 ## Non-goals
 ## Constraints
-<Platform, compatibility, privacy (real finance data stays local), defaults chosen.>
+<Platform, compatibility, privacy (real finance data stays local).>
+
+## Decisions
+- <question> → <user's answer>
 
 ## Open questions
+None
 ~~~
 
 Aim for 3–8 acceptance criteria. More than that usually means two features,

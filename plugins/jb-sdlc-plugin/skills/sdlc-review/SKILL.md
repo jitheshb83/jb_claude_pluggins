@@ -27,7 +27,9 @@ while it works, and collect everything before step 4.
    `security-review`, on any track.
 4. Write `review.md` from the template. De-duplicate, and drop false
    positives you verified, with one line on why.
-5. **Important findings are build work.** Run
+5. **Important findings are build work, and the fix plan needs approval.**
+   List the fixes you intend to make, one line each with its finding number,
+   and get the user's yes before anything changes. Then run
    `sdlc.py reopen build --note "review fixes"`, re-spawn `sdlc-builder` with
    the findings list (one builder per lane when the fixes fall in disjoint
    files, run in parallel as in `sdlc-build`), re-record the build evidence, and then re-run only the

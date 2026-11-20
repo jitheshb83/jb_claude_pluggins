@@ -5,6 +5,9 @@ description: SDLC phase 3. Delegates the approved plan.md to sdlc-builder agents
 
 # Phase 3: Build
 
+Build starts only once the user has approved `plan.md`. The hook enforces
+this, and nothing in this phase pushes or merges into the base.
+
 Building is where most tokens go, so it runs on Sonnet, which costs half as
 much as Opus per token, inside builder subagents. The main session only
 coordinates. If plan.md defines parallel lanes, the builders run at the same

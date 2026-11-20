@@ -40,9 +40,11 @@ def comment_text(line: str, ext: str) -> str | None:
             return None
         return s[1:].strip() if s.startswith("#") else None
     if ext in SLASH:
-        for p in ("//", "/*", "*/", "*"):
+        for p in ("//", "/*", "*/"):
             if s.startswith(p):
                 return s[len(p):].strip().rstrip("*/").strip()
+        if s == "*" or s.startswith("* "):  # block-comment continuation, not `*p = x;`
+            return s[1:].strip()
     return None
 
 

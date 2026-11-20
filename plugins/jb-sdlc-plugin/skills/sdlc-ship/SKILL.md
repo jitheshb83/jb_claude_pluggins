@@ -1,48 +1,52 @@
 ---
 name: sdlc-ship
-description: SDLC phase 5 — ships a reviewed feature, covering the fresh-branch check, version bump, final commit including docs/sdlc artifacts, push, and a PR whose body links the plan, review and (on the full track) spec. Use when the active SDLC feature is in the ship phase, or the user asks to ship, open the PR, or release the feature.
+description: SDLC phase 5. Prepares a reviewed feature for the user to publish, covering the fresh-branch check, version bump, a final local commit including the docs/sdlc artifacts, and a pr.md PR description. It hands over the exact push and PR commands and never pushes, opens a PR or merges itself. Use when the active SDLC feature is in the ship phase, or the user asks to ship, wrap up or prepare the PR.
 effort: low
 ---
 
-# Phase 5 — Ship
+# Phase 5: Ship (a local hand-off, never a publish)
+
+The SDLC never runs `git push`, `gh pr create` or `gh pr merge`, and never
+merges into the base branch. The hook blocks all of these. Publishing is
+the user's step.
 
 ## Steps
 
-1. **Branch freshness**, which the user's global rule requires before every commit:
+1. **Check the branch is fresh.** The user's global rule requires this
+   before every commit:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/sdlc.py" check-branch
    ```
-   If it prints `STALE`, stop. The work must move onto a fresh branch off the
-   updated base. Explain that to the user and ask before rebasing or
-   cherry-picking.
-2. **Version bump**, only where the repo versions releases:
-   - Claude Code plugin: `.claude-plugin/plugin.json` `version`. Use a minor
-     bump for a new skill, agent or feature and a patch bump for a fix.
-   - Python: `pyproject.toml` `version`, then `uv lock`.
+   If it prints `STALE`, stop. Explain the situation and ask how to move the
+   work onto a fresh branch.
+2. **Bump the version,** only where the repo versions its releases:
+   - Claude Code plugin: `version` in `.claude-plugin/plugin.json`. Use a
+     minor bump for a new skill, agent or feature, a patch bump for a fix.
+   - Python: `version` in `pyproject.toml`, then `uv lock`.
    - Android: `versionCode` +1 and `versionName` in `app/build.gradle(.kts)`.
-3. **Re-run the verification commands** if anything changed since the build
-   evidence was recorded, version bumps included.
-4. **Commit** the remaining changes. Include the `docs/sdlc/<feature>/` folder
-   and end the message with the session's commit attribution lines.
-5. **Confirm, then publish.** Pushing and opening a PR are outward-facing, so
-   ask once ("Push `<branch>` and open a PR against `<base>`?") unless the user
-   already said to ship. Then:
+3. **Re-run the verification** if anything changed since the build evidence
+   was recorded, including the version bump.
+4. **Write `<feature dir>/pr.md`,** the PR description:
+   - a 2–4 line summary;
+   - the acceptance criteria;
+   - links to the plan, the review and (full track) the spec;
+   - the build evidence line;
+   - the session's PR attribution line.
+
+   Leave out real financial figures.
+5. **Close the gate,** then **commit everything locally**, `docs/sdlc/<feature>/`
+   included, ending the message with the session's attribution lines:
    ```bash
-   git push -u origin HEAD
-   gh pr create --base <base> --title "<title>" --body-file <tmp body file>
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/sdlc.py" approve ship
+   git add -A && git commit -m "<summary>"
    ```
-   PR body: a 2–4 line summary, a list of the ACs, links to the spec, plan
-   and review files in the branch, the build evidence line, and the session's
-   PR attribution line. Leave out real financial figures.
-6. **Close the gate:**
+6. **Hand over** in five lines or fewer: the branch, the commit count, the
+   verification status, and the commands for the user to run:
    ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/sdlc.py" approve ship --pr <url>
+   git push -u origin <branch>
+   gh pr create --base <base> --title "<title>" --body-file docs/sdlc/<feature>/pr.md
    ```
-   Then commit and push that state.json change. This keeps the merged record
-   showing `done`.
-7. Report the PR URL. Remind the user of two things:
-   - After they merge it, the next feature starts from fresh `main`
-     (`git checkout main && git pull`), and the hook blocks further commits
-     on this branch.
-   - Run `/clear` before the next task. State is on disk, so nothing is
-     lost, and a fresh context costs far less per turn than this one.
+   Then remind them of two things:
+   - After the PR merges, run `git checkout main && git pull`. The hook
+     blocks further commits on this branch.
+   - Run `/clear` before the next task. State lives on disk.

@@ -14,6 +14,14 @@ ENV = {**os.environ, "SDLC_NO_GH": "1", "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAI
        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"}
 ENV.pop("SDLC_GATES", None)
 DIAG = '\n```mermaid\nflowchart LR\n    A["parse(x)"]:::new --> B\n    classDef new fill:#DCFCE7\n```\n'
+GOOD_SPEC = ("# Spec\n## Problem\n- totals double count\n## User flow\n" + DIAG +
+             "## Evidence\n- app.py:1 sets x = 1\n## Acceptance criteria\n- AC1: given x, then y\n"
+             "## Decisions\n- currency? -> NOK only (user)\n## Open questions\nNone\n")
+GOOD_PLAN = ("# Plan\n## Goal\n- fix totals\n## Change map\n" + DIAG +
+             "## Evidence\n- app.py:1 sets x = 1\n## Acceptance criteria\n- AC1: given x, then y\n"
+             "## Steps\n1. do it\n## Test plan\n| AC1 | tests/test_app.py::test_y |\n"
+             "## Open questions\nNone\n")
+GOOD_PLAN_NODIAG = GOOD_PLAN.replace(DIAG, "")
 
 
 
@@ -69,16 +77,16 @@ class TestLifecycle(Repo):
         self.assertIn("not approved yet", r.stderr)
 
         d = self.feature_dir()
-        (d / "spec.md").write_text("# Spec\n" + DIAG)
+        (d / "spec.md").write_text(GOOD_SPEC)
         cli(self.repo, "approve", "spec", "--note", "user: yes")
         r = cli(self.repo, "approve", "plan", check=False)
         self.assertIn("missing or empty", r.stderr)
-        (d / "plan.md").write_text("# Plan\n" + DIAG)
+        (d / "plan.md").write_text(GOOD_PLAN)
         cli(self.repo, "approve", "plan", "--note", "user: go")
         self.assertEqual(self.status()["phase"], "build")
 
         # editing an approved plan re-opens it
-        (d / "plan.md").write_text("# Plan v2\n" + DIAG)
+        (d / "plan.md").write_text(GOOD_PLAN.replace("do it", "do it v2"))
         st = self.status()
         self.assertEqual(st["phase"], "plan")
         self.assertEqual(st["gates"]["plan"], "stale")
@@ -92,17 +100,19 @@ class TestLifecycle(Repo):
         (d / "review.md").write_text("# Review\n\n## Verdict: PASS\n")
         cli(self.repo, "approve", "review")
 
-        self.assertIn("--pr", cli(self.repo, "approve", "ship", check=False).stderr)
-        cli(self.repo, "approve", "ship", "--pr", "https://example/pr/1")
+        self.assertIn("pr.md", cli(self.repo, "approve", "ship", check=False).stderr)
+        (d / "pr.md").write_text("Fix totals.\n")
+        st = json.loads(cli(self.repo, "approve", "ship").stdout)  # no push, no PR URL needed
+        self.assertEqual(st["gates"]["ship"], "approved")
         self.assertIsNone(self.status()["active"])  # done features aren't active
 
     def test_reopen_clears_later_gates(self):
         cli(self.repo, "new", "Thing", "--track", "full")
         d = self.feature_dir()
-        (d / "spec.md").write_text(DIAG)
-        cli(self.repo, "approve", "spec")
-        (d / "plan.md").write_text("p\n" + DIAG)
-        cli(self.repo, "approve", "plan")
+        (d / "spec.md").write_text(GOOD_SPEC)
+        cli(self.repo, "approve", "spec", "--note", "user: yes")
+        (d / "plan.md").write_text(GOOD_PLAN)
+        cli(self.repo, "approve", "plan", "--note", "user: yes")
         cli(self.repo, "approve", "build", "--evidence", "ok")
         cli(self.repo, "reopen", "plan", "--note", "scope change")
         g = self.status()["gates"]
@@ -118,13 +128,16 @@ class TestLiteTrack(Repo):
         self.assertIn("Acceptance criteria", (d / "plan.md").read_text())
         self.assertIn("no spec gate", cli(self.repo, "approve", "spec", check=False).stderr)
         self.assertEqual(gate(self.repo, "Edit", {"file_path": str(self.repo / "app.py")}).returncode, 2)
+        self.assertIn("still empty", cli(self.repo, "approve", "plan", "--note", "ok", check=False).stderr)
+        (d / "plan.md").write_text(GOOD_PLAN_NODIAG)
         cli(self.repo, "approve", "plan", "--note", "user: ok")
         self.assertEqual(self.status()["phase"], "build")
         self.assertEqual(gate(self.repo, "Edit", {"file_path": str(self.repo / "app.py")}).returncode, 0)
 
     def test_escalating_to_full_adds_spec_and_reopens(self):
         cli(self.repo, "new", "Grows")
-        cli(self.repo, "approve", "plan")
+        (self.feature_dir() / "plan.md").write_text(GOOD_PLAN_NODIAG)
+        cli(self.repo, "approve", "plan", "--note", "user: yes")
         st = json.loads(cli(self.repo, "track", "full").stdout)
         self.assertEqual((st["track"], st["phase"]), ("full", "spec"))
         self.assertTrue((self.feature_dir() / "spec.md").exists())
@@ -174,8 +187,8 @@ class TestWorktrees(Repo):
     def approved_feature(self):
         cli(self.repo, "new", "Lanes")
         d = self.feature_dir()
-        (d / "plan.md").write_text("# Plan\nLane A (files: a.py)\nLane B (files: b.py)\n" + DIAG)
-        cli(self.repo, "approve", "plan")
+        (d / "plan.md").write_text(GOOD_PLAN.replace("1. do it", "Lane A (files: a.py)\n1. do it\nLane B (files: b.py)\n2. more"))
+        cli(self.repo, "approve", "plan", "--note", "user: yes")
         sh(self.repo, "git", "add", "-A")
         sh(self.repo, "git", "commit", "-qm", "docs: plan")
 
@@ -220,8 +233,8 @@ class TestDiagrams(Repo):
         (d / "spec.md").write_text("# Spec\n```mermaid\nflowchart TD\n  A[parse(x)] --> end\n```\n")
         r = cli(self.repo, "approve", "spec", check=False)
         self.assertIn("quote the label", r.stderr)
-        (d / "spec.md").write_text("# Spec\n" + DIAG)
-        cli(self.repo, "approve", "spec")
+        (d / "spec.md").write_text(GOOD_SPEC)
+        cli(self.repo, "approve", "spec", "--note", "user: yes")
         (d / "plan.md").write_text("# Plan, no diagram\n")
         self.assertIn("needs at least one", cli(self.repo, "approve", "plan", check=False).stderr)
 
@@ -230,8 +243,8 @@ class TestDiagrams(Repo):
         d = self.feature_dir()
         (d / "plan.md").write_text("# Plan\n```mermaid\nflowchart LR\n  A:::ghost --> B\n```\n")
         self.assertIn("no classDef", cli(self.repo, "approve", "plan", check=False).stderr)
-        (d / "plan.md").write_text("# Plan\n")
-        cli(self.repo, "approve", "plan")
+        (d / "plan.md").write_text(GOOD_PLAN_NODIAG)
+        cli(self.repo, "approve", "plan", "--note", "user: yes")
 
     def test_check_diagrams_cli_and_shipped_templates(self):
         ok = cli(self.repo, "check-diagrams", str(PLUGIN / "references" / "diagrams.md"),
@@ -315,6 +328,126 @@ class TestLeanHook(Repo):
         self.assertEqual(lean("Write", {"file_path": "/x/calc.py", "content": NOISY_PY}, env=env), "")
 
 
+class TestReviewFindings(Repo):
+    """Regression tests for the code-review findings on PR #6."""
+
+    def test_pushed_fresh_branch_is_not_mistaken_for_merged(self):  # finding 1
+        sh(self.repo, "git", "checkout", "-qb", "feature/early-push")
+        sh(self.repo, "git", "push", "-qu", "origin", "feature/early-push")
+        self.assertEqual(gate(self.repo, "Bash", {"command": "git commit -m first"}).returncode, 0)
+        out = json.loads(cli(self.repo, "new", "Early push").stdout)
+        self.assertEqual(out["branch"], "feature/early-push")
+        sh(self.repo, "git", "checkout", "-q", "main")
+        sh(self.repo, "git", "checkout", "-qb", "feature/tracks-main", "origin/main")
+        self.assertEqual(gate(self.repo, "Bash", {"command": "git commit -m x"}).returncode, 0)
+
+    def test_state_json_cannot_be_edited_to_forge_approval(self):  # finding 3
+        cli(self.repo, "new", "Forge")
+        state = self.feature_dir() / "state.json"
+        r = gate(self.repo, "Edit", {"file_path": str(state)})
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("only by `sdlc.py approve`", r.stderr)
+        r = gate(self.repo, "Bash", {"command": f"sed -i '' s/a/b/ {state}"})
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(gate(self.repo, "Edit", {"file_path": str(self.feature_dir() / "plan.md")}).returncode, 0)
+
+    def test_shell_writes_obey_the_plan_gate(self):  # finding 4
+        cli(self.repo, "new", "Shell writes")
+        d = self.status()["dir"]
+        for cmd in ("sed -i '' 's/1/2/' app.py", "cat > src/new.py <<'EOF'\nx = 1 > 0\nEOF",
+                    "echo x >> app.py", "printf y | tee app.py", "cp /tmp/x app.py",
+                    "rm app.py", "git apply fix.patch", "touch src/z.py"):
+            self.assertEqual(gate(self.repo, "Bash", {"command": cmd}).returncode, 2, cmd)
+        for cmd in (f"cat > {d}/plan.md <<'EOF'\n# a > b\nEOF", "ls > /dev/null 2>&1",
+                    "uv run pytest -q 2>&1 | tail -n 5", "grep -n x app.py"):
+            self.assertEqual(gate(self.repo, "Bash", {"command": cmd}).returncode, 0, cmd)
+        (self.repo / d / "plan.md").write_text(GOOD_PLAN_NODIAG)
+        cli(self.repo, "approve", "plan", "--note", "user: yes")
+        self.assertEqual(gate(self.repo, "Bash", {"command": "sed -i '' 's/1/2/' app.py"}).returncode, 0)
+
+    def test_subshells_wrappers_and_bash_c_are_followed(self):  # finding 5
+        sh(self.repo, "git", "checkout", "-q", "main")
+        elsewhere = Path(self.tmp.name)
+        for cmd in (f"(cd {self.repo} && git commit -m x)", f"sudo git -C {self.repo} commit -m x",
+                    f"env FOO=1 git -C {self.repo} commit -m x",
+                    f"bash -c 'cd {self.repo} && git commit -m x'",
+                    f"echo $(git -C {self.repo} commit -m x)"):
+            self.assertEqual(gate(elsewhere, "Bash", {"command": cmd}).returncode, 2, cmd)
+
+    def test_lint_accepts_valid_mermaid(self):  # finding 6
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("sdlc", CLI)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        ok = {
+            "comma classDef": "flowchart LR\n  A:::a --> B:::b\n  classDef a,b fill:#eee",
+            "class with ;": "flowchart LR\n  A --> B\n  class A,B foo;\n  classDef foo fill:#eee",
+            "box": "sequenceDiagram\n  box Gray Team\n  participant A\n  end\n  A->>A: hi",
+            "front matter": "---\ntitle: Flow\n---\nflowchart LR\n  A --> B",
+            "xychart": "xychart-beta\n  x-axis [a, b]\n  bar [1, 2]",
+        }
+        for name, block in ok.items():
+            self.assertEqual(m.lint_mermaid(block), [], name)
+
+    def test_new_twice_same_day_does_not_crash_or_strand_a_branch(self):  # finding 7
+        cli(self.repo, "new", "Fix login")
+        first = self.feature_dir()
+        sh(self.repo, "git", "add", "-A")
+        sh(self.repo, "git", "commit", "-qm", "wip")
+        sh(self.repo, "git", "checkout", "-q", "main")
+        r = cli(self.repo, "new", "Fix login", check=False)
+        self.assertIn("already exists", r.stderr)
+        self.assertEqual(sh(self.repo, "git", "branch", "--show-current").stdout.strip(), "main")
+        out = json.loads(cli(self.repo, "new", "Fix login again").stdout)
+        self.assertNotEqual(out["dir"], str(first.relative_to(self.repo)))
+
+    def test_same_slug_dir_gets_a_suffix(self):  # finding 7 (dir collision on a fresh branch)
+        (self.repo / "docs" / "sdlc").mkdir(parents=True)
+        import datetime as dt
+        (self.repo / "docs" / "sdlc" / f"{dt.date.today().isoformat()}-dup").mkdir()
+        out = json.loads(cli(self.repo, "new", "Dup").stdout)
+        self.assertTrue(out["dir"].endswith("-dup-2"))
+
+    def test_lean_ignores_c_pointer_writes(self):  # finding 9
+        new = "void f(int *out, char *buf) {\n*out = len;\n*buf = 0;\n}\n"
+        self.assertEqual(lean("Edit", {"file_path": "/x/f.c", "old_string": "", "new_string": new}), "")
+
+    def test_new_pulls_the_base_before_branching(self):  # finding 10
+        other = Path(self.tmp.name) / "other"
+        sh(Path(self.tmp.name), "git", "clone", "-q", str(self.remote), str(other))
+        (other / "merged.py").write_text("y = 1\n")
+        sh(other, "git", "add", ".")
+        sh(other, "git", "commit", "-qm", "merged elsewhere")
+        sh(other, "git", "push", "-q", "origin", "main")
+        cli(self.repo, "new", "After merge")
+        self.assertTrue((self.repo / "merged.py").exists())
+
+
+class TestNoPublishAndEvidence(Repo):
+    def test_never_pushes_opens_or_merges_prs(self):
+        sh(self.repo, "git", "checkout", "-qb", "feature/x")
+        for cmd in ("git push -u origin HEAD", "gh pr create --fill", "gh pr merge 6 --squash",
+                    "cd . && git push"):
+            r = gate(self.repo, "Bash", {"command": cmd})
+            self.assertEqual(r.returncode, 2, cmd)
+            self.assertIn("never", r.stderr)
+        sh(self.repo, "git", "checkout", "-q", "main")
+        self.assertEqual(gate(self.repo, "Bash", {"command": "git merge feature/x"}).returncode, 2)
+        sh(self.repo, "git", "checkout", "-q", "feature/x")
+        self.assertEqual(gate(self.repo, "Bash", {"command": "git merge --no-ff lane-a"}).returncode, 0)
+
+    def test_approval_needs_evidence_no_open_questions_and_user_words(self):
+        cli(self.repo, "new", "Evidence")
+        d = self.feature_dir()
+        (d / "plan.md").write_text(GOOD_PLAN_NODIAG.replace("None\n", "- which currency?\n"))
+        self.assertIn("open question", cli(self.repo, "approve", "plan", "--note", "ok", check=False).stderr)
+        (d / "plan.md").write_text(GOOD_PLAN_NODIAG.replace("app.py:1 sets x = 1", "it probably works"))
+        self.assertIn("must cite", cli(self.repo, "approve", "plan", "--note", "ok", check=False).stderr)
+        (d / "plan.md").write_text(GOOD_PLAN_NODIAG)
+        self.assertIn("--note is required", cli(self.repo, "approve", "plan", check=False).stderr)
+        cli(self.repo, "approve", "plan", "--note", "user: approved as written")
+
+
 class TestBranchGate(Repo):
     def commit(self, cmd="git commit -m wip"):
         return gate(self.repo, "Bash", {"command": cmd})
@@ -363,8 +496,10 @@ class TestBranchGate(Repo):
 
     def test_blocks_push_to_main_from_feature_branch(self):
         sh(self.repo, "git", "checkout", "-qb", "feature/x")
-        self.assertEqual(gate(self.repo, "Bash", {"command": "git push origin HEAD:main"}).returncode, 2)
-        self.assertEqual(gate(self.repo, "Bash", {"command": "git push -u origin HEAD"}).returncode, 0)
+        allow = {**ENV, "SDLC_ALLOW_PUSH": "1"}
+        for cmd in ("git push origin HEAD:main", "git push origin +refs/heads/main", "git push origin +main"):
+            self.assertEqual(gate(self.repo, "Bash", {"command": cmd}, env=allow).returncode, 2, cmd)
+        self.assertEqual(gate(self.repo, "Bash", {"command": "git push -u origin HEAD"}, env=allow).returncode, 0)
 
     def test_bypass(self):
         r = gate(self.repo, "Bash", {"command": "git commit -m x"}, env={**ENV, "SDLC_GATES": "off"})
@@ -388,14 +523,14 @@ class TestPlanGate(Repo):
         self.assertEqual(self.edit(f"{d}/spec.md").returncode, 0)  # artifacts always editable
         self.assertEqual(self.edit("src/new_module.py").returncode, 2)  # new files too
 
-        (self.repo / d / "spec.md").write_text(DIAG)
-        cli(self.repo, "approve", "spec")
-        (self.repo / d / "plan.md").write_text("plan\n" + DIAG)
+        (self.repo / d / "spec.md").write_text(GOOD_SPEC)
+        cli(self.repo, "approve", "spec", "--note", "user: yes")
+        (self.repo / d / "plan.md").write_text(GOOD_PLAN)
         self.assertEqual(self.edit("app.py").returncode, 2)
-        cli(self.repo, "approve", "plan")
+        cli(self.repo, "approve", "plan", "--note", "user: yes")
         self.assertEqual(self.edit("app.py").returncode, 0)
 
-        (self.repo / d / "plan.md").write_text("plan changed\n" + DIAG)
+        (self.repo / d / "plan.md").write_text(GOOD_PLAN.replace("do it", "do more"))
         r = self.edit("app.py")
         self.assertEqual(r.returncode, 2)
         self.assertIn("re-approve", r.stderr)

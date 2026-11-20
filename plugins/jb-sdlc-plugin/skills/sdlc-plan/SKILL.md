@@ -22,7 +22,18 @@ this phase runs at high effort. The hook blocks code edits outside
    **one scout per area in the same message** so they run in parallel.
    Then read in full only the files they name that you will change or
    depend on.
-3. **Write plan.md** from the template that fits the track. Steps must be
+   Treat the scout's map as leads, not evidence. Before citing anything as
+   fact, open the cited lines yourself.
+3. **Discuss the approach before writing the plan.** Present:
+   - the evidence: what exists and what will change, each with `path:line`;
+   - the proposed approach and the one realistic alternative, with the
+     trade-off between them;
+   - the questions that decide the plan.
+
+   Ask in one `AskUserQuestion` and wait for the answers. Never plan around
+   something you assumed: an unverified API, file, flag, behaviour or
+   number is a question, not a step.
+4. **Write plan.md** from the template that fits the track. Steps must be
    small, ordered, and able to keep the suite green between them. Then
    decide the **lanes** (see below).
    - **Diagrams**, following the house style in `${CLAUDE_PLUGIN_ROOT}/references/diagrams.md`:
@@ -35,9 +46,12 @@ this phase runs at high effort. The hook blocks code edits outside
 
      Use at most 2 diagrams. Run `sdlc.py check-diagrams`; `approve plan`
      refuses if a diagram fails the lint or a required one is missing.
-4. **Approval.** Show the plan, or on the lite track its Goal and
-   Acceptance criteria and the Changes table, and ask whether to approve or
-   change it. Once the user approves:
+5. **Approval, always before any implementation.** Show the plan (on the
+   lite track: the Goal, the Acceptance criteria, the Changes table and the
+   diagram link) and ask whether to approve or change it. `approve plan`
+   refuses when a section is empty, when Evidence cites nothing actually
+   read or run, when an open question remains, when a diagram is broken or
+   missing, or when `--note` is missing. Once the user approves:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/sdlc.py" approve plan --note "<user's words>"
    ```
@@ -51,8 +65,11 @@ this phase runs at high effort. The hook blocks code edits outside
 ## Goal                      <!-- lite only: 1–2 sentences -->
 ## Acceptance criteria       <!-- lite only: AC1: Given/when/then ... -->
 
+## Evidence
+- <path:line or `command`>: <what it shows>. Write 'nothing existing' for code that is entirely new.
+
 ## Approach
-<One paragraph.>
+<One paragraph, plus the rejected alternative in one line.>
 
 ```mermaid
 <change map: flowchart TD, a subgraph per area, nodes classed new/changed/external/risk/test>
@@ -80,6 +97,12 @@ Lane B (files: <paths>):
 - <smoke check>
 
 ## Risks & rollback     <!-- full track; lite: one line or omit -->
+
+## Decisions
+- <question> → <user's answer>
+
+## Open questions
+None
 ~~~
 
 ## Verification by stack

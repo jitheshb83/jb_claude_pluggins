@@ -2,7 +2,7 @@
 """State + branch-freshness core for the jb-sdlc-plugin.
 
 One feature = one directory under <repo>/docs/sdlc/<date>-<slug>/ holding
-spec.md, plan.md, review.md and state.json. The current phase is derived:
+spec.md, plan.md, review.md, pr.md and state.json. The current phase is derived:
 it is the first phase in PHASES that has no valid approval. Approvals of
 spec/plan/review are bound to the sha256 of their file, so editing an
 approved artifact silently re-opens that gate (and every later one).
@@ -97,6 +97,13 @@ def _merged_pr(root: Path, branch: str) -> int | None:
     return max(merged) if merged else None
 
 
+def _had_own_commits(root: Path, branch: str) -> bool:
+    """True if anything was ever committed on this branch (reflog evidence).
+    A freshly created branch, pushed or not, has only a 'branch: Created' entry."""
+    log = git(root, "reflog", "show", "--format=%gs", f"refs/heads/{branch}") or ""
+    return any(ln.startswith(("commit", "merge", "cherry-pick")) for ln in log.splitlines())
+
+
 def check_branch(root: Path, base: str | None = None) -> str | None:
     """None if it is safe to commit here, else a human-readable reason."""
     branch = current_branch(root)
@@ -116,7 +123,7 @@ def check_branch(root: Path, base: str | None = None) -> str | None:
 
     upstream = git(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
     ref = _base_ref(root, base)
-    if upstream and ref:
+    if upstream and ref and _had_own_commits(root, branch):
         ahead = git(root, "rev-list", "--count", f"{ref}..HEAD")
         if ahead == "0" and git(root, "rev-list", "--count", f"{upstream}..HEAD") == "0":
             return (f"'{branch}' was pushed but has no commits that aren't already in "
@@ -134,12 +141,14 @@ def check_branch(root: Path, base: str | None = None) -> str | None:
 
 MERMAID_TYPES = ("flowchart", "graph", "sequenceDiagram", "stateDiagram", "stateDiagram-v2",
                  "erDiagram", "classDiagram", "gantt", "journey", "mindmap", "timeline", "pie",
-                 "gitGraph", "quadrantChart", "block-beta", "C4Context", "C4Container")
+                 "gitGraph", "quadrantChart", "block-beta", "C4Context", "C4Container",
+                 "requirementDiagram", "xychart-beta", "sankey-beta", "packet-beta",
+                 "architecture-beta", "kanban", "C4Component", "C4Dynamic", "C4Deployment")
 _FENCE = re.compile(r"^```mermaid[^\n]*\n(.*?)^```", re.M | re.S)
 _SHAPES = [("([", "])"), ("[(", ")]"), ("((", "))"), ("{{", "}}"), ("[[", "]]"),
            ("[/", "/]"), ("[\\", "\\]"), ("[", "]"), ("(", ")"), ("{", "}"), (">", "]")]
 _NODE = re.compile(r"(?:^|[\s;&>-])([A-Za-z_][\w-]*)(?=\(\[|\[\(|\(\(|\{\{|\[\[|\[/|\[\\\\|\[|\(|\{)")
-_BLOCK_OPEN = re.compile(r"^\s*(alt|opt|loop|par|critical|break|rect)\b")
+_BLOCK_OPEN = re.compile(r"^\s*(alt|opt|loop|par|critical|break|rect|box)\b")
 
 
 def mermaid_blocks(text: str) -> list[str]:
@@ -163,7 +172,11 @@ def _labels(line: str):
 
 def lint_mermaid(block: str) -> list[str]:
     errs: list[str] = []
-    lines = [ln for ln in block.splitlines() if ln.strip() and not ln.strip().startswith("%%")]
+    raw = block.splitlines()
+    if raw and raw[0].strip() == "---":  # YAML front matter (title/config)
+        close = next((i for i, ln in enumerate(raw[1:], 1) if ln.strip() == "---"), None)
+        raw = raw[close + 1:] if close else raw
+    lines = [ln for ln in raw if ln.strip() and not ln.strip().startswith("%%")]
     if not lines:
         return ["empty diagram"]
     head = lines[0].split()
@@ -178,11 +191,12 @@ def lint_mermaid(block: str) -> list[str]:
         subs = sum(1 for ln in body if ln.strip().startswith("subgraph"))
         if subs != ends:
             errs.append(f"{subs} subgraph vs {ends} end")
-        defined = {ln.split()[1] for ln in body if ln.strip().startswith("classDef") and len(ln.split()) > 1}
+        defined = {n for ln in body if ln.strip().startswith("classDef") and len(ln.split()) > 1
+                   for n in ln.split()[1].split(",")}
         used = set(re.findall(r":::([\w-]+)", block))
         for ln in body:
-            if ln.strip().startswith("class "):
-                used.update(c for c in ln.split()[-1:])
+            if ln.strip().startswith("class ") and len(ln.split()) > 2:
+                used.update(n for n in ln.split()[-1].rstrip(";").split(",") if n)
         for c in sorted(used - defined):
             errs.append(f"class '{c}' used but no classDef")
         for ln in body:
@@ -237,6 +251,59 @@ def diagram_required(state: dict, ph: str) -> bool:
         lanes = plan.exists() and re.search(r"(?m)^Lane [A-C]\b", plan.read_text())
         return state.get("track") == "full" or bool(lanes)
     return False
+
+
+# ----------------------------------------------------------------- content
+
+
+def sections(text: str) -> dict[str, list[str]]:
+    """'## heading' (lowercased, comments stripped) -> its meaningful lines."""
+    out: dict[str, list[str]] = {}
+    cur, fence = None, False
+    for ln in text.splitlines():
+        st = ln.strip()
+        if st.startswith(("```", "~~~")):
+            fence = not fence
+            if cur is not None and fence:
+                out[cur].append("[diagram]")
+            continue
+        if not fence and ln.startswith("## "):
+            cur = re.sub(r"<!--.*?-->", "", ln[3:]).strip().lower()
+            out.setdefault(cur, [])
+            continue
+        if cur is None or fence or not st or st.startswith("<!--") or re.fullmatch(r"<[^>]*>", st):
+            continue
+        out[cur].append(st)
+    return out
+
+
+def _section(secs: dict, name: str) -> list[str] | None:
+    return next((v for k, v in secs.items() if k.startswith(name)), None)
+
+
+EVIDENCE_REF = re.compile(r"[\w./-]+\.\w{1,6}(:\d+)?|`[^`]+`|nothing existing", re.I)
+NONE_LINE = re.compile(r"^(?:[-*]\s*)?(?:none|n/a)\b", re.I)
+
+
+def check_content(state: dict, ph: str) -> list[str]:
+    """Approval blockers in spec.md / plan.md: unfilled sections, no evidence,
+    unresolved questions. Answers from the discussion belong under ## Decisions."""
+    f = state["_dir"] / ARTIFACT[ph]
+    secs = sections(f.read_text())
+    need = {"spec": ["problem", "acceptance criteria", "evidence"],
+            "plan": ["steps", "test plan", "evidence"]}[ph]
+    if ph == "plan" and state.get("track") == "lite":
+        need = ["goal", "acceptance criteria"] + need
+    errs = [f"{f.name}: '## {n}' is missing or still empty" for n in need if not _section(secs, n)]
+    ev = _section(secs, "evidence")
+    if ev and not any(EVIDENCE_REF.search(ln) for ln in ev):
+        errs.append(f"{f.name}: '## Evidence' must cite what was actually read or run "
+                    f"(path:line or a `command`), or say 'nothing existing' for new code")
+    oq = [ln for ln in (_section(secs, "open questions") or []) if not NONE_LINE.match(ln)]
+    if oq:
+        errs.append(f"{f.name}: {len(oq)} open question(s): clarify with the user, record the answers "
+                    f"under '## Decisions', then leave '## Open questions' as 'None'")
+    return errs
 
 
 # ------------------------------------------------------------------- state
@@ -310,10 +377,15 @@ SPEC_TEMPLATE = """# Spec: {title}
 ## User flow
 <mermaid flowchart: see references/diagrams.md>
 ## Context
+## Evidence
+<one bullet per claim about existing code: path:line or `command` + what it showed>
 ## Acceptance criteria
 ## Non-goals
 ## Constraints
+## Decisions
+<question -> the user's answer, from the discussion>
 ## Open questions
+None
 """
 
 PLAN_LITE_TEMPLATE = """# Plan (lite): {title}
@@ -322,11 +394,17 @@ PLAN_LITE_TEMPLATE = """# Plan (lite): {title}
      by the sdlc-plan skill. Editing it after approval re-opens the gate. -->
 
 ## Goal
+## Evidence
+<one bullet per claim about existing code: path:line or `command` + what it showed>
 ## Acceptance criteria
 ## Changes
 ## Steps
 ## Test plan
 ## Verification
+## Decisions
+<question -> the user's answer, from the discussion>
+## Open questions
+None
 """
 
 
@@ -353,18 +431,32 @@ def cmd_new(a) -> None:
     slug = a.slug or slugify(a.title)
     base = a.base or default_base(root)
     branch = current_branch(root)
-    if not branch or branch in BASE_BRANCHES or branch == base:
+    on_base = not branch or branch in BASE_BRANCHES or branch == base
+    if on_base:
         branch = f"feature/{slug}"
-        if git(root, "checkout", "-b", branch) is None:
-            sys.exit(f"sdlc: could not create branch {branch}")
+        if git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}") is not None:
+            sys.exit(f"sdlc: branch {branch} already exists — pick another --slug.")
     else:
         reason = check_branch(root, base)
         if reason:
             sys.exit(f"sdlc: refusing to start on this branch: {reason}")
-    if active_feature(root, branch):
-        sys.exit(f"sdlc: branch '{branch}' already has an active feature — see `sdlc.py status`.")
-    d = root / SDLC_DIR / f"{dt.date.today().isoformat()}-{slug}"
-    d.mkdir(parents=True, exist_ok=False)
+        if active_feature(root, branch):
+            sys.exit(f"sdlc: branch '{branch}' already has an active feature — see `sdlc.py status`.")
+    stem = f"{dt.date.today().isoformat()}-{slug}"
+    d, n = root / SDLC_DIR / stem, 2
+    while d.exists():
+        d, n = root / SDLC_DIR / f"{stem}-{n}", n + 1
+    if on_base:
+        if not a.no_pull and git(root, "remote", "get-url", "origin"):
+            pulled = subprocess.run(["git", "-C", str(root), "pull", "--ff-only", "-q"],
+                                    capture_output=True, text=True, timeout=60)
+            if pulled.returncode != 0:
+                sys.exit(f"sdlc: `git pull --ff-only` on {current_branch(root) or base} failed — "
+                         f"sync the base first (or --no-pull when offline):\n"
+                         f"{pulled.stderr.strip()}")
+        if git(root, "checkout", "-b", branch) is None:
+            sys.exit(f"sdlc: could not create branch {branch}")
+    d.mkdir(parents=True)
     if a.track == "full":
         (d / "spec.md").write_text(SPEC_TEMPLATE.format(title=a.title))
     else:
@@ -413,9 +505,12 @@ def cmd_approve(a) -> None:
         f = s["_dir"] / ARTIFACT[ph]
         if not f.exists() or not f.read_text().strip():
             sys.exit(f"sdlc: {f.relative_to(root)} is missing or empty.")
-        diagram_errs = check_diagrams(f, require=diagram_required(s, ph)) if ph in ("spec", "plan") else []
-        if diagram_errs:
-            sys.exit("sdlc: fix the diagrams first:\n  " + "\n  ".join(diagram_errs))
+        if ph in ("spec", "plan"):
+            errs = check_diagrams(f, require=diagram_required(s, ph)) + check_content(s, ph)
+            if not (a.note or "").strip():
+                errs.append("--note is required: quote the user's approval of this exact file")
+            if errs:
+                sys.exit("sdlc: not ready to approve:\n  " + "\n  ".join(errs))
         if ph == "review" and not re.search(r"(?im)^[#*\s]*verdict\W*pass\b", f.read_text()):
             sys.exit("sdlc: review.md has no 'Verdict: PASS' line — fix findings first.")
         entry["sha256"] = sha(f)
@@ -424,9 +519,12 @@ def cmd_approve(a) -> None:
             sys.exit("sdlc: approving build needs --evidence (the test command and its result).")
         entry["evidence"] = a.evidence
     if ph == "ship":
-        if not a.pr:
-            sys.exit("sdlc: approving ship needs --pr <url>.")
-        entry["pr"] = a.pr
+        pr_md = s["_dir"] / "pr.md"
+        if not pr_md.exists() or not pr_md.read_text().strip():
+            sys.exit(f"sdlc: write {pr_md.relative_to(root)} (the PR description) first.")
+        entry["head"] = git(root, "rev-parse", "--short", "HEAD")
+        if a.pr:
+            entry["pr"] = a.pr
     s.setdefault("approvals", {})[ph] = entry
     s.setdefault("history", []).append({"at": now(), "event": f"approved {ph}"})
     save(s)
@@ -488,6 +586,7 @@ def main(argv: list[str] | None = None) -> None:
     n.add_argument("--slug")
     n.add_argument("--base")
     n.add_argument("--track", choices=TRACKS, default="lite")
+    n.add_argument("--no-pull", action="store_true", help="skip `git pull --ff-only` of the base")
     tr = sub.add_parser("track", help="switch the active feature between lite and full")
     tr.add_argument("track", choices=TRACKS)
     sub.add_parser("status", help="show the active feature for this branch")
@@ -495,7 +594,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("phase", choices=PHASES)
     ap.add_argument("--note", help="who approved / what was said")
     ap.add_argument("--evidence", help="build: test command + result")
-    ap.add_argument("--pr", help="ship: PR URL")
+    ap.add_argument("--pr", help="ship: PR URL, if the user already opened one")
     ro = sub.add_parser("reopen", help="clear a gate and every later one")
     ro.add_argument("phase", choices=PHASES)
     ro.add_argument("--note")

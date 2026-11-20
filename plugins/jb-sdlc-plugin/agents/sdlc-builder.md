@@ -40,6 +40,13 @@ lanes.
 
 ## Hard rules
 
+- **Never imagine, always verify.** If the code doesn't match the plan's
+  Evidence (a function missing, a different signature, a test command that
+  doesn't exist), stop and return BLOCKED with what you actually found. Don't
+  improvise around it.
+- **Never push, open a PR or merge into the base branch.** Commit locally on
+  your branch only. Merging a lane into the feature branch is the caller's
+  job.
 - **Never edit `plan.md` or `spec.md`.** That would re-open the gate and
   block your own edits. If the plan is wrong, or needs a new dependency, a
   scope change or files it doesn't list, stop and return BLOCKED.
