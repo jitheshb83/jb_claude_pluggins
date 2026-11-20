@@ -5,6 +5,7 @@ name=${SDLC_HOOK_NAME:-$(basename "$0")}
 here=$(cd "$(dirname "$0")" && pwd -P)
 case "$name" in
   pre-push|pre-commit|pre-merge-commit) exec python3 "$here/githook.py" "$name" "$@" ;;
+  reference-transaction) [ "$1" = prepared ] && exec python3 "$here/githook.py" "$name" "$@" ;;
 esac
 dir=""
 for scope in --local --global --system; do

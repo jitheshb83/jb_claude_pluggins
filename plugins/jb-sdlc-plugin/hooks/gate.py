@@ -30,6 +30,7 @@ import sdlc  # noqa: E402
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 _RAW = ""
+TREE = "\0tree"  # write target meaning "rewrites tracked files" (merge, apply, stash pop, ...)
 # Prefix commands that run another command, with the options that take a value.
 WRAPPERS: dict[str, set[str]] = {
     "sudo": {"-u", "-g", "-h", "-p", "-C", "-U", "-r", "-t", "-D"}, "doas": {"-u", "-C"},
@@ -51,6 +52,9 @@ ANY_GIT = re.compile(r"(?<![\w.-])[\"']?git[\"']?" + GIT_OPTS + r"\s+(push|commi
 ANY_GH_PR = re.compile(r"(?<![\w.-])[\"']?gh[\"']?(?:\s+-{1,2}[\w-]+(?:[= ]\S+)?)*\s+pr\s+(create|merge)\b")
 GH_VALUE_OPTS = {"-R", "--repo", "--hostname"}
 GH_API_PUBLISH = re.compile(r"(?<![\w.-])gh\b[^;&|\n]*\bapi\b[^;&|\n]*/(?:pulls|merges)\b(?![^;&|\n]*(?:-X|--method)\s*GET)")
+ENV_EVASION = re.compile(
+    r"(?<![\w.-])(?:CLAUDECODE|SDLC_[A-Z_]+)=|\bunset\b[^;&|\n]*\b(?:CLAUDECODE|SDLC_)"
+    r"|(?<![\w.-])env\s+(?:-\S*\s+)*-(?:i\b|-ignore-environment|u\s*(?:CLAUDECODE|SDLC_|GIT_CONFIG))")
 HOOK_EVASION = re.compile(r"--no-verify\b|\bcore\.hooksPath\b|\bGIT_CONFIG_(?:COUNT|KEY|VALUE|PARAMETERS|GLOBAL|SYSTEM|NOSYSTEM)\b|\bSDLC_GITHOOKS\b")
 ALL_ARGS = {"rm", "touch", "mkdir", "rmdir", "truncate", "tee", "mv"}
 DEST_ARG = {"cp", "install", "ln", "rsync"}
@@ -196,6 +200,9 @@ def segments(command: str, cwd: Path):
                 toks = shlex.split(raw)
             except ValueError:
                 toks = raw.split()
+            if ENV_EVASION.search(" ".join(toks)):
+                block("refused: the command changes CLAUDECODE / SDLC_* in its environment, which "
+                      "would switch the SDLC gates off. Only the user sets those.")
             toks = strip_wrappers(toks)
             if not toks:
                 continue
@@ -311,16 +318,19 @@ def write_targets(toks: list[str], raw: str, here: Path) -> list[str]:
     elif cmd in ("sed", "gsed", "perl"):
         targets += _inplace_files(cmd, toks)
     elif cmd == "patch":
-        targets.append(".")
+        targets.append(TREE)
     elif cmd == "git":
         _, sub, gargs = parse_git(here, toks)
         hard_reset = sub == "reset" and any(f in gargs for f in ("--hard", "--merge", "--keep"))
         stash_out = sub == "stash" and gargs[:1] in (["pop"], ["apply"])
         if sub == "apply" or sub in GIT_TREE_REWRITES or hard_reset or stash_out:
-            targets.append(".")
+            targets.append(TREE)
         elif sub in GIT_PATH_SUBS:
             if "--" in gargs:
-                targets += [t for t in gargs[gargs.index("--") + 1:] if t]
+                ops = [t for t in gargs[gargs.index("--") + 1:] if t]
+                whole = sub in ("checkout", "restore") and any(
+                    (here / t).resolve() == (sdlc.repo_root(here) or here) for t in ops)
+                targets += [TREE] if whole else ops
             elif sub in ("rm", "mv"):
                 targets += [t for t in gargs if not t.startswith("-") and t]
             else:  # checkout/restore <path>: only operands that are existing files
@@ -328,7 +338,7 @@ def write_targets(toks: list[str], raw: str, here: Path) -> list[str]:
     return targets
 
 
-def path_block(path: Path) -> str | None:
+def path_block(path: Path, held_check: bool = True) -> str | None:
     """Reason a write to `path` must be refused, or None."""
     root = sdlc.repo_root(path)
     if not root:
@@ -337,11 +347,13 @@ def path_block(path: Path) -> str | None:
         rel = path.relative_to(root)
     except ValueError:
         return None
-    in_sdlc = rel.parts[:2] == sdlc.SDLC_DIR.parts
-    if in_sdlc and rel.name == "state.json":
+    folded = [part.casefold() for part in rel.parts]
+    in_sdlc = folded[:2] == [part.casefold() for part in sdlc.SDLC_DIR.parts]
+    if in_sdlc and rel.name.casefold() == "state.json":
         return (f"{rel} records approvals and is written only by `sdlc.py approve`. "
                 f"Approvals come from the user, never from editing state.")
-    held = [f for f in (root / sdlc.SDLC_DIR).glob("*/state.json") if path in f.parents]
+    held = [f for f in (root / sdlc.SDLC_DIR).glob("*/state.json")
+            if held_check and str(path).casefold() in {str(a).casefold() for a in f.parents}]
     if held:
         return (f"{rel} holds SDLC feature state ({held[0].parent.name}); deleting, moving or "
                 f"replacing it would bypass the gates. Only sdlc.py manages feature folders.")
@@ -361,16 +373,22 @@ def path_block(path: Path) -> str | None:
 def gate_bash(command: str, cwd: Path, depth: int = 0) -> None:
     allow_push = os.environ.get("SDLC_ALLOW_PUSH", "").lower() in ("1", "true", "yes")
     text = strip_heredocs(command)
-    found = {m.group(1) for m in ANY_GIT.finditer(text)}
+    # Quoted text is data (grep patterns, -m messages) unless it holds a command substitution;
+    # quoted payloads that do run (bash -c, eval) are unwrapped by the segment parser below.
+    scan = text if ("$(" in text or "`" in text) else mask_quotes(text)
+    found = {m.group(1) for m in ANY_GIT.finditer(scan)}
+    if ENV_EVASION.search(scan):
+        block("refused: the command changes CLAUDECODE / SDLC_* in its environment, which would "
+              "switch the SDLC gates off. Only the user sets those, before the session starts.")
     if not allow_push and "push" in found:
         block("`git push` refused — the SDLC never pushes. Tell the user the branch is "
               "ready and give them the exact push command to run themselves.")
     if found and HOOK_EVASION.search(text) or re.search(r"\bunset\b[^;&|\n]*\bGIT_CONFIG", text):
         block("refused: this command would skip or override the SDLC git hooks "
               "(--no-verify, core.hooksPath, GIT_CONFIG_*).")
-    if GH_API_PUBLISH.search(text) and not allow_push:
+    if GH_API_PUBLISH.search(scan) and not allow_push:
         block("`gh api` on pulls/merges refused — the SDLC never publishes or merges.")
-    gh = ANY_GH_PR.search(text)
+    gh = ANY_GH_PR.search(scan)
     if gh and not allow_push:
         block(f"`gh pr {gh.group(1)}` refused — the SDLC never publishes or merges. "
               f"Hand the user the PR body file and the command to run themselves.")
@@ -410,7 +428,10 @@ def gate_bash(command: str, cwd: Path, depth: int = 0) -> None:
                 if reason:
                     block(f"`git {sub}` refused — {reason}")
         for t in write_targets(toks, raw, here):
-            reason = path_block((here / os.path.expanduser(t)).resolve())
+            if t == TREE:
+                reason = path_block((sdlc.repo_root(here) or here), held_check=False)
+            else:
+                reason = path_block((here / os.path.expanduser(t)).resolve())
             if reason:
                 block(f"shell write refused — {reason}")
     # A commit/merge the segment parser couldn't place (wrapped, backgrounded,
@@ -423,7 +444,7 @@ def gate_bash(command: str, cwd: Path, depth: int = 0) -> None:
         feat = sdlc.active_feature(root)
         reason = sdlc.check_branch(root, (feat or {}).get("base"))
         if reason:
-            block(f"`git commit` refused — {reason}")
+            block(f"`git {'/'.join(sorted(found & {'commit', 'merge'} - parsed))}` refused — {reason}")
 
 
 def main() -> None:

@@ -851,6 +851,89 @@ class TestFourthReview(Repo):
         self.assertIn("sdlc skill", route(self.repo, "\nimplement caching").stdout)
 
 
+class TestFifthReview(Repo):
+    def blocked(self, cmd):
+        return gate(self.repo, "Bash", {"command": cmd}).returncode == 2
+
+    def approved(self, title="Approved"):
+        cli(self.repo, "new", title)
+        d = self.feature_dir()
+        (d / "plan.md").write_text(GOOD_PLAN_NODIAG)
+        cli(self.repo, "approve", "plan", "--note", "user: yes")
+        return d
+
+    def test_tree_commands_work_once_plan_is_approved(self):  # finding 1
+        self.approved()
+        for cmd in ("git merge --no-ff --no-edit lane-a", "git merge --abort", "git pull",
+                    "git apply p.diff", "git stash pop", "git reset --hard HEAD", "git checkout -- ."):
+            self.assertFalse(self.blocked(cmd), cmd)
+        self.assertTrue(self.blocked("rm -rf ."))  # still can't wipe the feature folder
+
+    def test_case_variants_of_state_json(self):  # finding 2
+        cli(self.repo, "new", "Case")
+        d = self.status()["dir"]
+        for name in ("State.json", "STATE.JSON"):
+            self.assertEqual(gate(self.repo, "Write", {"file_path": str(self.repo / d / name)}).returncode, 2)
+            self.assertTrue(self.blocked(f"echo x > {d}/{name}"))
+        self.assertTrue(self.blocked(f"rm -rf {d.upper()}"))
+
+    def test_inline_env_cannot_switch_gates_off(self):  # finding 3
+        sh(self.repo, "git", "checkout", "-qb", "feature/x")
+        for cmd in ("CLAUDECODE= git commit -am wip", "SDLC_GATES=off git commit -am wip",
+                    "SDLC_ALLOW_PUSH=1 git push", "env -i git commit -m x", "env -u CLAUDECODE git push",
+                    "export SDLC_GATES=off", "unset CLAUDECODE", "bash -c 'SDLC_GATES=off git commit -m x'"):
+            self.assertTrue(self.blocked(cmd), cmd)
+        self.assertFalse(self.blocked('SDLC="python3 sdlc.py"; $SDLC status'))
+
+    def test_reopened_plan_keeps_approved_work(self):  # finding 4
+        d = self.approved()
+        drift_ev = {"hook_event_name": "PostToolUse", "tool_name": "Bash", "cwd": str(self.repo)}
+        run_drift = lambda: subprocess.run([sys.executable, str(DRIFT)], input=json.dumps(drift_ev),
+                                           env=ENV, capture_output=True, text=True).stdout
+        (self.repo / "app.py").write_text("x = 'built under approval'\n")
+        (d / "plan.md").write_text(GOOD_PLAN_NODIAG.replace("do it", "do it better"))  # gate re-opens
+        self.assertEqual(run_drift(), "")  # build work is not reported
+        (self.repo / "new_after_reopen.py").write_text("y = 1\n")
+        self.assertIn("new_after_reopen.py", run_drift())
+        self.assertNotIn("app.py", run_drift())
+
+    def test_quoted_mentions_are_data(self):  # finding 5 (nit)
+        sh(self.repo, "git", "checkout", "-qb", "feature/x")
+        for cmd in ('grep -rn "git push" .', 'git commit -m "docs: never git push"', "rg 'gh pr create'"):
+            self.assertFalse(self.blocked(cmd), cmd)
+        for cmd in ('echo "$(git push)"', "bash -c 'git push'", "eval 'git push'"):
+            self.assertTrue(self.blocked(cmd), cmd)
+
+    def test_base_branch_ref_cannot_be_moved(self):  # finding 6 (nit)
+        env = claude_env()
+        sh(self.repo, "git", "checkout", "-qb", "feature/x")
+        (self.repo / "w.py").write_text("w = 1\n")
+        sh(self.repo, "git", "add", ".")
+        sh(self.repo, "git", "commit", "-qm", "work")
+        for args in (["git", "branch", "-f", "main", "HEAD"], ["git", "update-ref", "refs/heads/main", "HEAD"]):
+            r = run(self.repo, *args, env=env)
+            self.assertNotEqual(r.returncode, 0, args)
+        self.assertNotEqual(sh(self.repo, "git", "rev-parse", "main").stdout,
+                            sh(self.repo, "git", "rev-parse", "HEAD").stdout)
+        other = Path(self.tmp.name) / "upstream"  # fast-forward to origin/main stays allowed
+        sh(Path(self.tmp.name), "git", "clone", "-q", str(self.remote), str(other))
+        (other / "u.py").write_text("u = 1\n")
+        sh(other, "git", "add", ".")
+        sh(other, "git", "commit", "-qm", "upstream")
+        sh(other, "git", "push", "-q", "origin", "main")
+        sh(self.repo, "git", "checkout", "-q", "main")
+        self.assertEqual(run(self.repo, "git", "pull", "-q", "--ff-only", env=env).returncode, 0)
+
+    def test_rename_entries_parse_cleanly(self):  # finding 7 (nit)
+        m = load_module(CLI, "sdlc_ren")
+        cli(self.repo, "new", "Rename")
+        sh(self.repo, "git", "add", "-A")
+        sh(self.repo, "git", "commit", "-qm", "docs")
+        sh(self.repo, "git", "mv", "app.py", "renamed.py")
+        dirty = m.dirty_code(self.repo)
+        self.assertEqual(sorted(dirty), ["renamed.py"])
+
+
 class TestBranchGate(Repo):
     def commit(self, cmd="git commit -m wip"):
         return gate(self.repo, "Bash", {"command": cmd})

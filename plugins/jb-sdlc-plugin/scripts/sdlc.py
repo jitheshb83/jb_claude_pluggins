@@ -368,9 +368,14 @@ def dirty_code(root: Path) -> dict[str, str]:
                                 capture_output=True, text=True, timeout=5).stdout
     except (OSError, subprocess.TimeoutExpired):
         status = ""
-    for entry in status.split("\0"):
+    fields, i = status.split("\0"), 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
         if len(entry) < 4:
             continue
+        if entry[0] in "RC" or entry[1] in "RC":
+            i += 1  # next field is the rename/copy source, without a status prefix
         rel = entry[3:]
         if Path(rel).parts[:2] == SDLC_DIR.parts:
             continue
@@ -379,20 +384,28 @@ def dirty_code(root: Path) -> dict[str, str]:
     return out
 
 
-def save_baseline(root: Path, state: dict) -> None:
+def save_baseline(root: Path, state: dict, approved: bool = False) -> None:
     bf = _baseline_file(root, state)
     if bf:
-        bf.write_text(json.dumps(dirty_code(root)))
+        bf.write_text(json.dumps({"approved": approved, "files": dirty_code(root)}))
 
 
 def drift(root: Path, state: dict) -> list[str]:
-    """Code files changed since the feature started (shell writes the hook can't see)."""
+    """Code changed while the plan gate is closed — shell writes the hook can't see.
+    The baseline is taken at `new` and at every plan approval; when an approved plan
+    is re-opened (plan.md edited, reopen, track change), work done under the approval
+    becomes the new baseline instead of being reported."""
     bf = _baseline_file(root, state)
     try:
         base = json.loads(bf.read_text()) if bf and bf.exists() else {}
     except ValueError:
         base = {}
-    return sorted(p for p, h in dirty_code(root).items() if base.get(p) != h)
+    if "files" not in base:
+        base = {"approved": False, "files": base}
+    if base.get("approved"):
+        save_baseline(root, state, approved=False)
+        return []
+    return sorted(p for p, h in dirty_code(root).items() if base["files"].get(p) != h)
 
 
 # ------------------------------------------------------------------- state
@@ -673,6 +686,8 @@ def cmd_approve(a) -> None:
     s.setdefault("approvals", {})[ph] = entry
     s.setdefault("history", []).append({"at": now(), "event": f"approved {ph}"})
     save(s)
+    if ph in ("spec", "plan") and approval_valid(s, "spec") and approval_valid(s, "plan"):
+        save_baseline(root, s, approved=True)
     print(json.dumps(_status(s, root), indent=2))
 
 

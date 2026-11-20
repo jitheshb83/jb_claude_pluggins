@@ -23,7 +23,7 @@ def refuse(msg: str) -> None:
     sys.exit(1)
 
 
-def enforce(name: str, root: Path) -> None:
+def enforce(name: str, root: Path, data: bytes = b"") -> None:
     if os.environ.get("CLAUDECODE") != "1" or os.environ.get("SDLC_GATES", "").lower() in ("off", "0", "false"):
         return
     allow_push = os.environ.get("SDLC_ALLOW_PUSH", "").lower() in ("1", "true", "yes")
@@ -32,6 +32,17 @@ def enforce(name: str, root: Path) -> None:
     branch = sdlc.current_branch(root)
     if name == "pre-merge-commit" and (branch in sdlc.BASE_BRANCHES or branch == sdlc.default_base(root)):
         refuse(f"the SDLC never merges into '{branch}'. The user merges the PR.")
+    if name == "reference-transaction":
+        bases = sdlc.BASE_BRANCHES | {sdlc.default_base(root)}
+        for line in data.decode(errors="replace").splitlines():
+            parts = line.split()
+            if len(parts) != 3 or not parts[2].startswith("refs/heads/"):
+                continue
+            b = parts[2].removeprefix("refs/heads/")
+            if b in bases and parts[1] != sdlc.git(root, "rev-parse", "--verify", "--quiet",
+                                                   f"refs/remotes/origin/{b}"):
+                refuse(f"refusing to move '{b}' to a commit that isn't origin/{b}: the SDLC never "
+                       f"changes the base branch (only fast-forwards it to the remote).")
     if name == "pre-commit":
         feat = sdlc.active_feature(root)
         reason = sdlc.check_branch(root, (feat or {}).get("base"))
@@ -63,7 +74,7 @@ def main() -> None:
     data = sys.stdin.buffer.read() if not sys.stdin.isatty() else b""
     top = sdlc.git(Path.cwd(), "rev-parse", "--show-toplevel")
     root = Path(top) if top else Path.cwd()
-    enforce(name, root)
+    enforce(name, root, data)
     orig = original_hooks_dir(root)
     hook = orig / name if orig else None
     if hook and hook.is_file() and os.access(hook, os.X_OK):
