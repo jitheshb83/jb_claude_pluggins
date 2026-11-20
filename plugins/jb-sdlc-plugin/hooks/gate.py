@@ -32,7 +32,12 @@ EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 WRAPPERS = {"sudo", "env", "command", "nohup", "time", "exec", "builtin", "nice", "xargs"}
 SHELLS = {"bash", "sh", "zsh"}
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)([\w.-]+)\1")
-REDIRECT = re.compile(r"(?:^|[^<>&\w])(?:\d?>>?|&>>?)\s*([^\s;&|<>()]+)")
+REDIRECT_OP = re.compile(r"(?:^|[^<>&\w])(?:\d?>>?|&>>?)\s*")
+# Fail-closed: anywhere in the command, quoted payloads included (bash -c '...',
+# "$(...)", timeout/nice/sudo prefixes, `&` chains). Heredoc bodies are skipped.
+GIT_OPTS = r"(?:\s+(?:-C|-c|--git-dir|--work-tree)\s+\S+|\s+-{1,2}[\w-]+(?:=\S+)?)*"
+ANY_GIT = re.compile(r"(?<![\w./-])git" + GIT_OPTS + r"\s+(push|commit|merge)\b")
+ANY_GH_PR = re.compile(r"(?<![\w./-])gh\s+pr\s+(create|merge)\b")
 ALL_ARGS = {"rm", "touch", "mkdir", "rmdir", "truncate", "tee"}
 LAST_ARG = {"cp", "mv", "install", "ln", "rsync"}
 
@@ -55,8 +60,23 @@ def strip_heredocs(cmd: str) -> str:
     return "\n".join(out)
 
 
+def mask_quotes(text: str) -> str:
+    """Same length as text, with the contents of quoted strings blanked out."""
+    out, q = [], None
+    for c in text:
+        if q:
+            out.append(c if c == q else " ")
+            if c == q:
+                q = None
+        else:
+            if c in "'\"":
+                q = c
+            out.append(c)
+    return "".join(out)
+
+
 def split_commands(cmd: str) -> list[str]:
-    """Split on && || ; | newline $( ` — but only outside quotes."""
+    """Split on && || ; | & newline $( ` — but only outside quotes."""
     out, cur, q, i = [], [], None, 0
     while i < len(cmd):
         c = cmd[i]
@@ -74,7 +94,8 @@ def split_commands(cmd: str) -> list[str]:
             out.append("".join(cur))
             cur = []
             i += 1
-        elif c in ";|\n`":
+        elif c in ";|\n`" or (c == "&" and cmd[i - 1:i] not in ("<", ">")
+                                and cmd[i + 1:i + 2] != ">"):
             out.append("".join(cur))
             cur = []
         else:
@@ -125,8 +146,23 @@ def parse_git(here: Path, toks: list[str]):
     return d, (toks[i] if i < len(toks) else ""), toks[i + 1:]
 
 
+def redirect_targets(raw: str) -> list[str]:
+    """Redirect targets, ignoring any `>` that sits inside a quoted string."""
+    out = []
+    for m in REDIRECT_OP.finditer(mask_quotes(raw)):
+        rest = raw[m.end():]
+        if rest[:1] in ("'", '"'):
+            end = rest.find(rest[0], 1)
+            t = rest[1:end] if end > 0 else rest[1:]
+        else:
+            t = re.split(r"[\s;&|<>()]", rest, 1)[0]
+        if t and not t.startswith(("&", "/dev/")):
+            out.append(t)
+    return out
+
+
 def write_targets(toks: list[str], raw: str) -> list[str]:
-    targets = [t for t in REDIRECT.findall(raw) if not t.startswith(("&", "/dev/"))]
+    targets = redirect_targets(raw)
     cmd, args = toks[0], [t for t in toks[1:] if not t.startswith("-")]
     if cmd in ALL_ARGS:
         targets += args
@@ -167,17 +203,22 @@ def path_block(path: Path) -> str | None:
 
 def gate_bash(command: str, cwd: Path) -> None:
     allow_push = os.environ.get("SDLC_ALLOW_PUSH", "").lower() in ("1", "true", "yes")
+    text = strip_heredocs(command)
+    found = {m.group(1) for m in ANY_GIT.finditer(text)}
+    if not allow_push and "push" in found:
+        block("`git push` refused — the SDLC never pushes. Tell the user the branch is "
+              "ready and give them the exact push command to run themselves.")
+    gh = ANY_GH_PR.search(text)
+    if gh and not allow_push:
+        block(f"`gh pr {gh.group(1)}` refused — the SDLC never publishes or merges. "
+              f"Hand the user the PR body file and the command to run themselves.")
+    parsed: set[str] = set()
     for here, toks, raw in segments(command, cwd):
-        if toks[0] == "gh" and toks[1:3] in (["pr", "create"], ["pr", "merge"]) and not allow_push:
-            block(f"`gh {' '.join(toks[1:3])}` refused — the SDLC never publishes or merges. "
-                  f"Hand the user the PR body file and the command to run themselves.")
         if toks[0] == "git":
             d, sub, args = parse_git(here, toks)
+            parsed.add(sub)
             root = sdlc.repo_root(d)
             if sub == "push":
-                if not allow_push:
-                    block("`git push` refused — the SDLC never pushes. Tell the user the branch is "
-                          "ready and give them the exact push command to run themselves.")
                 for arg in args:
                     target = arg.split(":")[-1].lstrip("+").removeprefix("refs/heads/")
                     if target in sdlc.BASE_BRANCHES and not arg.startswith("-"):
@@ -196,6 +237,17 @@ def gate_bash(command: str, cwd: Path) -> None:
             reason = path_block((here / os.path.expanduser(t)).resolve())
             if reason:
                 block(f"shell write refused — {reason}")
+    # A commit/merge the segment parser couldn't place (wrapped, backgrounded,
+    # nested): check it against the session's repo rather than letting it through.
+    root = sdlc.repo_root(cwd)
+    if root and found & {"commit", "merge"} - parsed:
+        cur = sdlc.current_branch(root)
+        if "merge" in found - parsed and (cur in sdlc.BASE_BRANCHES or cur == sdlc.default_base(root)):
+            block(f"`git merge` into '{cur}' refused — the SDLC never merges into the base.")
+        feat = sdlc.active_feature(root)
+        reason = sdlc.check_branch(root, (feat or {}).get("base"))
+        if reason:
+            block(f"`git commit` refused — {reason}")
 
 
 def main() -> None:

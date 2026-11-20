@@ -1,4 +1,5 @@
 """End-to-end tests for sdlc.py and the PreToolUse gate, against throwaway git repos."""
+import datetime as dt
 import json
 import os
 import subprocess
@@ -446,6 +447,119 @@ class TestNoPublishAndEvidence(Repo):
         (d / "plan.md").write_text(GOOD_PLAN_NODIAG)
         self.assertIn("--note is required", cli(self.repo, "approve", "plan", check=False).stderr)
         cli(self.repo, "approve", "plan", "--note", "user: approved as written")
+
+
+def load_module(path, name):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+class TestSecondReview(Repo):
+    """Regression tests for the second code review of PR #6."""
+
+    def test_push_is_blocked_whatever_wraps_it(self):  # findings 1 + 2
+        sh(self.repo, "git", "checkout", "-qb", "feature/x")
+        for cmd in ("timeout 30 git push", "nice -n 5 git push", "sudo -u me git push",
+                    "sleep 0 & git push", 'echo "$(git push)"', "bash -c 'git push origin HEAD'",
+                    "git -C . push", "gh  pr  create --fill", 'sh -c "gh pr merge 1"'):
+            self.assertEqual(gate(self.repo, "Bash", {"command": cmd}).returncode, 2, cmd)
+        for cmd in ("git stash push -m wip", "git log --oneline", "echo pushing"):
+            self.assertEqual(gate(self.repo, "Bash", {"command": cmd}).returncode, 0, cmd)
+        msg = "git commit -F - <<'EOF'\nnever git push from the SDLC\nEOF"
+        self.assertEqual(gate(self.repo, "Bash", {"command": msg}).returncode, 0)
+
+    def test_wrapped_commit_on_main_is_still_checked(self):  # findings 1 + 2
+        for cmd in ("timeout 30 git commit -m x", "sleep 0 & git commit -m x"):
+            self.assertEqual(gate(self.repo, "Bash", {"command": cmd}).returncode, 2, cmd)
+
+    def test_reapproving_changed_spec_reopens_later_gates(self):  # finding 3
+        cli(self.repo, "new", "Reopen", "--track", "full")
+        d = self.feature_dir()
+        (d / "spec.md").write_text(GOOD_SPEC)
+        cli(self.repo, "approve", "spec", "--note", "yes")
+        (d / "plan.md").write_text(GOOD_PLAN)
+        cli(self.repo, "approve", "plan", "--note", "yes")
+        cli(self.repo, "approve", "build", "--evidence", "ok")
+        (d / "spec.md").write_text(GOOD_SPEC.replace("AC1: given x, then y", "AC1: given x, then z"))
+        st = json.loads(cli(self.repo, "approve", "spec", "--note", "yes, new AC").stdout)
+        self.assertEqual(st["phase"], "plan")
+        self.assertEqual((st["gates"]["plan"], st["gates"]["build"]), ("open", "open"))
+
+    def test_dropping_to_lite_needs_user_and_reopens_plan(self):  # finding 4
+        cli(self.repo, "new", "Downgrade", "--track", "full")
+        d = self.feature_dir()
+        (d / "spec.md").write_text(GOOD_SPEC)
+        cli(self.repo, "approve", "spec", "--note", "yes")
+        (d / "plan.md").write_text(GOOD_PLAN)
+        cli(self.repo, "approve", "plan", "--note", "yes")
+        self.assertIn("--note", cli(self.repo, "track", "lite", check=False).stderr)
+        st = json.loads(cli(self.repo, "track", "lite", "--note", "user: lite is fine").stdout)
+        self.assertEqual(st["phase"], "plan")
+        self.assertEqual(gate(self.repo, "Edit", {"file_path": str(self.repo / "app.py")}).returncode, 2)
+
+    def test_old_merged_pr_on_a_recreated_branch_is_ignored(self):  # finding 5
+        m = load_module(CLI, "sdlc_mod")
+        prs = [{"number": 7, "state": "MERGED", "mergedAt": "2026-01-01T00:00:00Z"}]
+        created_after = dt.datetime(2026, 2, 1, tzinfo=dt.timezone.utc).timestamp()
+        created_before = dt.datetime(2025, 12, 1, tzinfo=dt.timezone.utc).timestamp()
+        self.assertIsNone(m.pick_merged(prs, created_after))
+        self.assertEqual(m.pick_merged(prs, created_before), 7)
+        self.assertIsNone(m.pick_merged(prs + [{"number": 9, "state": "OPEN"}], created_before))
+        sh(self.repo, "git", "checkout", "-qb", "feature/stamp")
+        self.assertIsNotNone(m._branch_created(self.repo, "feature/stamp"))
+
+    def test_quoted_arrows_are_not_writes(self):  # finding 6
+        cli(self.repo, "new", "Arrows")
+        for cmd in ('git commit -m "spec -> plan"', 'echo "a > b"', "echo 'x >> y'"):
+            self.assertEqual(gate(self.repo, "Bash", {"command": cmd}).returncode, 0, cmd)
+        self.assertEqual(gate(self.repo, "Bash", {"command": 'echo x > "app.py"'}).returncode, 2)
+
+    def test_new_honours_base_from_main(self):  # finding 7
+        sh(self.repo, "git", "checkout", "-qb", "develop")
+        (self.repo / "dev_only.py").write_text("d = 1\n")
+        sh(self.repo, "git", "add", ".")
+        sh(self.repo, "git", "commit", "-qm", "develop work")
+        sh(self.repo, "git", "push", "-qu", "origin", "develop")
+        sh(self.repo, "git", "checkout", "-q", "main")
+        out = json.loads(cli(self.repo, "new", "On develop", "--base", "develop").stdout)
+        self.assertEqual(out["base"], "develop")
+        self.assertTrue((self.repo / "dev_only.py").exists())
+        upstream = sh(self.repo, "git", "rev-parse", "--abbrev-ref", "@{u}", check=False)
+        self.assertNotEqual(upstream.returncode, 0)  # not tracking origin/develop
+
+    def test_merge_on_github_detected_without_manual_fetch(self):  # finding 8
+        sh(self.repo, "git", "checkout", "-qb", "feature/m")
+        (self.repo / "app.py").write_text("x = 9\n")
+        sh(self.repo, "git", "commit", "-qam", "change")
+        sh(self.repo, "git", "push", "-qu", "origin", "feature/m")
+        other = Path(self.tmp.name) / "gh-side"
+        sh(Path(self.tmp.name), "git", "clone", "-q", str(self.remote), str(other))
+        sh(other, "git", "merge", "-q", "--ff-only", "origin/feature/m")
+        sh(other, "git", "push", "-q", "origin", "main", ":feature/m")
+        r = gate(self.repo, "Bash", {"command": "git commit -m more"})
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("merged", r.stderr)
+
+    def test_review_template_is_not_a_pass(self):  # finding 9
+        tpl = (PLUGIN / "skills" / "sdlc-review" / "SKILL.md").read_text()
+        cli(self.repo, "new", "Tpl")
+        d = self.feature_dir()
+        (d / "plan.md").write_text(GOOD_PLAN_NODIAG)
+        cli(self.repo, "approve", "plan", "--note", "yes")
+        cli(self.repo, "approve", "build", "--evidence", "ok")
+        (d / "review.md").write_text(tpl.split("~~~markdown")[-1] if "~~~markdown" in tpl
+                                     else tpl.split("```markdown")[-1])
+        self.assertIn("Verdict: PASS", cli(self.repo, "approve", "review", check=False).stderr)
+
+    def test_router_ignores_noun_forms(self):  # finding 10
+        for p in ("List the developer settings in this repo", "Summarize the implementation notes",
+                  "who refactored this last year?"):
+            self.assertEqual(route(self.repo, p).stdout, "", p)
+        for p in ("Implement CSV export", "please refactor the parser", "can you develop a widget"):
+            self.assertIn("sdlc skill", route(self.repo, p).stdout, p)
 
 
 class TestBranchGate(Repo):

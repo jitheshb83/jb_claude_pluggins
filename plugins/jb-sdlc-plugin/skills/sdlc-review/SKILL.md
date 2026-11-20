@@ -55,7 +55,7 @@ Diff: <base>...<branch> @ <short sha> · reviewers: sdlc-reviewer[, code-review,
 | # | Severity | Where | Finding | Resolution |
 |---|---|---|---|---|
 
-## Verdict: PASS
+## Verdict: FAIL   <!-- change to PASS only when no important finding is open -->
 ```
 
 `approve review` refuses unless the file has a `Verdict: PASS` line. The

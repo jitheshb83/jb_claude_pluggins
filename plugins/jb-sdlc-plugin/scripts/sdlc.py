@@ -75,8 +75,34 @@ def _base_ref(root: Path, base: str) -> str | None:
     return None
 
 
+def _branch_created(root: Path, branch: str) -> float | None:
+    """Unix time of the branch's oldest reflog entry (its creation)."""
+    log = git(root, "reflog", "show", "--date=unix", "--format=%gd", f"refs/heads/{branch}") or ""
+    stamps = re.findall(r"@\{(\d+)\}", log)
+    return float(stamps[-1]) if stamps else None
+
+
+def pick_merged(prs: list[dict], created: float | None) -> int | None:
+    """The merged PR that belongs to this incarnation of the branch, if any.
+    A PR merged before the branch was (re)created is an older branch's PR."""
+    if any(p.get("state") == "OPEN" for p in prs):
+        return None
+    hits = []
+    for p in prs:
+        if p.get("state") != "MERGED":
+            continue
+        at = p.get("mergedAt")
+        try:
+            ts = dt.datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp() if at else None
+        except ValueError:
+            ts = None
+        if created is None or ts is None or ts > created:
+            hits.append(p["number"])
+    return max(hits) if hits else None
+
+
 def _merged_pr(root: Path, branch: str) -> int | None:
-    """PR number if the branch's PR is merged and no PR is still open. Needs gh."""
+    """PR number if this branch's PR is merged and no PR is still open. Needs gh."""
     if os.environ.get("SDLC_NO_GH") or not shutil.which("gh"):
         return None
     remote = git(root, "remote", "get-url", "origin") or ""
@@ -85,16 +111,13 @@ def _merged_pr(root: Path, branch: str) -> int | None:
     try:
         out = subprocess.run(
             ["gh", "pr", "list", "--head", branch, "--state", "all",
-             "--json", "number,state", "--limit", "20"],
+             "--json", "number,state,mergedAt", "--limit", "20"],
             cwd=root, capture_output=True, text=True, timeout=8,
         )
         prs = json.loads(out.stdout) if out.returncode == 0 else []
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         return None
-    if any(p.get("state") == "OPEN" for p in prs):
-        return None
-    merged = [p["number"] for p in prs if p.get("state") == "MERGED"]
-    return max(merged) if merged else None
+    return pick_merged(prs, _branch_created(root, branch))
 
 
 def _had_own_commits(root: Path, branch: str) -> bool:
@@ -102,6 +125,21 @@ def _had_own_commits(root: Path, branch: str) -> bool:
     A freshly created branch, pushed or not, has only a 'branch: Created' entry."""
     log = git(root, "reflog", "show", "--format=%gs", f"refs/heads/{branch}") or ""
     return any(ln.startswith(("commit", "merge", "cherry-pick")) for ln in log.splitlines())
+
+
+def refresh_remote(root: Path, max_age: float = 60) -> None:
+    """`git fetch --prune origin`, at most once a minute, never fatal. Without it a
+    PR merged on GitHub mid-session is invisible when gh isn't available."""
+    if os.environ.get("SDLC_NO_FETCH") or not git(root, "remote", "get-url", "origin"):
+        return
+    gd = git(root, "rev-parse", "--git-common-dir")
+    fh = (root / gd / "FETCH_HEAD") if gd else None
+    try:
+        if fh and fh.exists() and dt.datetime.now().timestamp() - fh.stat().st_mtime < max_age:
+            return
+    except OSError:
+        pass
+    git(root, "fetch", "--prune", "-q", "origin", timeout=10)
 
 
 def check_branch(root: Path, base: str | None = None) -> str | None:
@@ -115,6 +153,7 @@ def check_branch(root: Path, base: str | None = None) -> str | None:
     base = base or default_base(root)
     if branch == base:
         return f"you are on the base branch '{base}'. Branch off it first."
+    refresh_remote(root)
 
     track = git(root, "for-each-ref", "--format=%(upstream:track)", f"refs/heads/{branch}")
     if track == "[gone]":
@@ -447,14 +486,23 @@ def cmd_new(a) -> None:
     while d.exists():
         d, n = root / SDLC_DIR / f"{stem}-{n}", n + 1
     if on_base:
-        if not a.no_pull and git(root, "remote", "get-url", "origin"):
+        has_origin = bool(git(root, "remote", "get-url", "origin"))
+        start: list[str] = []
+        if a.base and a.base != current_branch(root):
+            if has_origin and not a.no_pull:
+                git(root, "fetch", "-q", "origin", a.base, timeout=60)
+            ref = _base_ref(root, a.base)
+            if not ref:
+                sys.exit(f"sdlc: base '{a.base}' not found locally or on origin.")
+            start = ["--no-track", ref]
+        elif has_origin and not a.no_pull:
             pulled = subprocess.run(["git", "-C", str(root), "pull", "--ff-only", "-q"],
                                     capture_output=True, text=True, timeout=60)
             if pulled.returncode != 0:
                 sys.exit(f"sdlc: `git pull --ff-only` on {current_branch(root) or base} failed — "
                          f"sync the base first (or --no-pull when offline):\n"
                          f"{pulled.stderr.strip()}")
-        if git(root, "checkout", "-b", branch) is None:
+        if git(root, "checkout", "-q", "-b", branch, *start) is None:
             sys.exit(f"sdlc: could not create branch {branch}")
     d.mkdir(parents=True)
     if a.track == "full":
@@ -525,6 +573,10 @@ def cmd_approve(a) -> None:
         entry["head"] = git(root, "rev-parse", "--short", "HEAD")
         if a.pr:
             entry["pr"] = a.pr
+    prev = s.get("approvals", {}).get(ph)
+    if ph in ARTIFACT and (not prev or prev.get("sha256") != entry.get("sha256")):
+        for later in PHASES[PHASES.index(ph) + 1:]:
+            s.get("approvals", {}).pop(later, None)  # built/reviewed against the old text
     s.setdefault("approvals", {})[ph] = entry
     s.setdefault("history", []).append({"at": now(), "event": f"approved {ph}"})
     save(s)
@@ -544,6 +596,13 @@ def cmd_reopen(a) -> None:
 def cmd_track(a) -> None:
     root = _root_or_die()
     s = _feature_or_die(root)
+    if s.get("track") == a.track:
+        sys.exit(f"sdlc: already on the {a.track} track.")
+    if a.track == "lite":
+        if not (a.note or "").strip():
+            sys.exit("sdlc: dropping to lite removes the spec gate — needs --note with the user's words.")
+        for ph in PHASES[PHASES.index("plan"):]:
+            s.get("approvals", {}).pop(ph, None)  # the lite plan must carry the ACs and be re-approved
     s["track"] = a.track
     if a.track == "full":
         spec = s["_dir"] / "spec.md"
@@ -551,7 +610,7 @@ def cmd_track(a) -> None:
             spec.write_text(SPEC_TEMPLATE.format(title=s["title"]))
         for ph in PHASES:  # escalating re-opens everything: the spec now leads
             s.get("approvals", {}).pop(ph, None)
-    s.setdefault("history", []).append({"at": now(), "event": f"track -> {a.track}"})
+    s.setdefault("history", []).append({"at": now(), "event": f"track -> {a.track}: {a.note or ''}"})
     save(s)
     print(json.dumps(_status(s, root), indent=2))
 
@@ -589,6 +648,7 @@ def main(argv: list[str] | None = None) -> None:
     n.add_argument("--no-pull", action="store_true", help="skip `git pull --ff-only` of the base")
     tr = sub.add_parser("track", help="switch the active feature between lite and full")
     tr.add_argument("track", choices=TRACKS)
+    tr.add_argument("--note", help="the user's words (required to drop to lite)")
     sub.add_parser("status", help="show the active feature for this branch")
     ap = sub.add_parser("approve", help="record a gate approval")
     ap.add_argument("phase", choices=PHASES)

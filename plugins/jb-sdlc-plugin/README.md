@@ -127,11 +127,11 @@ file re-opens its gate and every gate after it.
 
 | Rule | How |
 |---|---|
-| **Never publishes** | The hook blocks `git push`, `gh pr create`, `gh pr merge`, and `git merge` while on `main`/`master`. Ship ends with a local commit, a `pr.md`, and the commands for you to run. Merging plan lanes into the feature branch is still allowed. |
+| **Never publishes** | The hook blocks `git push`, `gh pr create`, `gh pr merge`, and `git merge` while on `main`/`master`. The push and PR checks fail closed: they match anywhere in the command, including after `timeout`/`nice`/`sudo`, in `&` chains and inside `bash -c '…'` or `$(…)`. Heredoc bodies such as commit messages are skipped, and a `-m` message that literally says `git push` is refused too. Ship ends with a local commit, a `pr.md`, and the commands for you to run. Merging plan lanes into the feature branch is still allowed. |
 | **Every plan approved first** | **Lite and full:** code changes outside `docs/sdlc/` are blocked until you approve `plan.md`, whether made with Edit, Write, MultiEdit or NotebookEdit, or through shell writes (`>`, `tee`, `sed -i`, `cp`, `mv`, `rm`, `touch`, `patch`, `git apply`). **Quick:** a 2–4 line plan in chat needs your explicit yes; the skill requires this, since there are no files for a hook to check. Re-plans and review fix lists need approval too. |
 | **Discussion, with evidence** | Spec and plan start with a discussion round: the evidence found, the approach and its alternative, and questions for you. `approve` refuses when a required section is empty, when `## Evidence` cites nothing that was actually read or run (`path:line` or a `` `command` ``), when `## Open questions` isn't `None`, or when `--note` doesn't carry your words. |
-| **Approvals can't be forged** | Only `sdlc.py approve` writes `state.json`; the hook blocks edits to it. Approvals are tied to each file's sha256. |
-| **Fresh branch** | Commits are blocked on `main`/`master`. They're also blocked on a branch whose upstream is `[gone]`, whose PR is merged (checked with `gh`), or whose own commits, recorded in its reflog, are all in the base already. A branch that was just created and pushed counts as fresh. `new` runs `git pull --ff-only` on the base before branching. |
+| **Approvals can't be forged** | Only `sdlc.py approve` writes `state.json`; the hook blocks edits to it. Approvals are tied to each file's sha256. Re-approving an edited spec or plan clears the build and review approvals after it, and dropping from full to lite needs `--note` with your words and re-opens the plan. |
+| **Fresh branch** | Before judging, it runs `git fetch --prune` (at most once a minute) so a merge on GitHub is seen. Commits are blocked on `main`/`master`. They're also blocked on a branch whose upstream is `[gone]`, whose PR merged after the branch was created (checked with `gh`), or whose own commits, recorded in its reflog, are all in the base already. A branch that was just created and pushed counts as fresh. `new` runs `git pull --ff-only` on the base before branching. |
 
 **Switches:**
 
@@ -142,6 +142,7 @@ file re-opens its gate and every gate after it.
 | `SDLC_AUTOROUTE=off` | Disables the router. |
 | `SDLC_LEAN=off` | Disables the output-token watchdog. |
 | `SDLC_NO_GH=1` | Skips the merged-PR lookup. |
+| `SDLC_NO_FETCH=1` | Skips the pre-check `git fetch`, for offline use. |
 
 A hook that hits an internal error allows the action.
 
