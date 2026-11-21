@@ -15,6 +15,11 @@
       "name": "jb-google-notify-plugin",
       "source": "./plugins/jb-google-notify-plugin",
       "description": "Google account onboarding and report/notification delivery via Gmail for jb_gateway_mcp."
+    },
+    {
+      "name": "jb-sdlc-plugin",
+      "source": "./plugins/jb-sdlc-plugin",
+      "description": "Lean AI SDLC (Spec → Plan → Build → Review → Ship) with committed artifacts and hook-enforced gates. No jb_gateway_mcp dependency."
     }
   ]
 }

@@ -17,6 +17,7 @@ connects their own accounts locally.
 |---|---|
 | [`jb-finance-mcp-plugin`](plugins/jb-finance-mcp-plugin/) | Bank account onboarding + local HTML finance reports |
 | [`jb-google-notify-plugin`](plugins/jb-google-notify-plugin/) | Google account onboarding + report/notification delivery via Gmail |
+| [`jb-sdlc-plugin`](plugins/jb-sdlc-plugin/) | Lean AI SDLC (Spec → Plan → Build → Review → Ship) with hook-enforced gates — no `jb_gateway_mcp` needed |
 
 Each plugin is independently installable and depends only on
 `jb_gateway_mcp` being installed standalone — not on each other. See each
