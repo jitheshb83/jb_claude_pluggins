@@ -409,11 +409,22 @@ class TestReviewFindings(Repo):
 class TestNoPublishAndEvidence(Repo):
     def test_never_pushes_opens_or_merges_prs(self):
         sh(self.repo, "git", "checkout", "-qb", "feature/x")
-        for cmd in ("git push -u origin HEAD", "gh pr create --fill", "gh pr merge 6 --squash",
-                    "cd . && git push"):
+        for cmd in ("git push -u origin HEAD", "gh pr create --fill"):
+            r = gate(self.repo, "Bash", {"command": cmd})
+            self.assertEqual(r.returncode, 0, cmd)
+            out = json.loads(r.stdout)["hookSpecificOutput"]
+            self.assertEqual((out["hookEventName"], out["permissionDecision"]), ("PreToolUse", "ask"))
+            self.assertTrue(out["permissionDecisionReason"])
+        for cmd in ("gh pr merge 6 --squash", "git push --force", "git push -f origin HEAD",
+                    "git push --force-with-lease", "git push origin +HEAD", "git push origin HEAD:main",
+                    "git push origin main", "git push --delete origin x", "git push origin :x",
+                    "git push --mirror", "cd . && git push", "cd . && git push && git push --force"):
             r = gate(self.repo, "Bash", {"command": cmd})
             self.assertEqual(r.returncode, 2, cmd)
             self.assertIn("never", r.stderr)
+        sh(self.repo, "git", "checkout", "-q", "main")
+        self.assertEqual(gate(self.repo, "Bash", {"command": "git push"}).returncode, 2)
+        sh(self.repo, "git", "checkout", "-q", "feature/x")
         self.assertEqual(gate(self.repo, "Bash", {"command": "git merge --no-ff lane-a"}).returncode, 0)
         sh(self.repo, "git", "checkout", "-q", "main")  # merging into the base: refused by git itself
         (self.repo / "m.py").write_text("m = 1\n")
@@ -451,7 +462,7 @@ class TestSecondReview(Repo):
         sh(self.repo, "git", "checkout", "-qb", "feature/x")
         for cmd in ("timeout 30 git push", "nice -n 5 git push", "sudo -u me git push",
                     "sleep 0 & git push", 'echo "$(git push)"', "bash -c 'git push origin HEAD'",
-                    "git -C . push", "gh  pr  create --fill", 'sh -c "gh pr merge 1"'):
+                    "git -C . push", "gh  pr  merge 2", 'sh -c "gh pr merge 1"'):
             self.assertEqual(gate(self.repo, "Bash", {"command": cmd}).returncode, 2, cmd)
         for cmd in ("git stash push -m wip", "git log --oneline", "echo pushing"):
             self.assertEqual(gate(self.repo, "Bash", {"command": cmd}).returncode, 0, cmd)
@@ -1015,6 +1026,78 @@ class TestSeventhReview(Repo):
 
     def test_readme_names_aliases_not_versions(self):  # finding 10
         self.assertNotRegex((PLUGIN / "README.md").read_text(), r"(?:Opus|Sonnet|Haiku) \d")
+
+
+class TestAskBeforePublish(Repo):
+    def setUp(self):
+        super().setUp()
+        sh(self.repo, "git", "checkout", "-qb", "feature/x")
+        self.token = self.repo / ".git" / "sdlc-push-ok"
+
+    def ask(self, cmd="git push -u origin HEAD"):
+        r = gate(self.repo, "Bash", {"command": cmd})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r
+
+    def push(self, *extra):
+        return run(self.repo, "git", "push", "-q", "-u", "origin", "HEAD", *extra, env=claude_env())
+
+    def commit(self, name="n.py"):
+        (self.repo / name).write_text("n = 1\n")
+        sh(self.repo, "git", "add", ".")
+        sh(self.repo, "git", "commit", "-qm", name)
+
+    def test_token_is_written_on_ask_and_bound_to_sha_and_ref(self):
+        r = self.ask()
+        tok = json.loads(self.token.read_text())
+        head = sh(self.repo, "git", "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(tok["pushes"], [{"ref": "refs/heads/feature/x", "sha": head}])
+        self.assertTrue(55 < tok["expires"] - dt.datetime.now().timestamp() <= 60)
+        self.assertIn("feature/x", json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_pr_create_asks_without_a_push_token(self):
+        self.ask("gh pr create --fill")
+        self.assertFalse(self.token.exists())
+
+    def test_prepush_allows_an_approved_push_once(self):
+        self.ask()
+        self.assertEqual(self.push().returncode, 0)
+        self.assertFalse(self.token.exists())
+        self.commit()
+        r = self.push()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("never pushes", r.stderr)
+
+    def test_prepush_refuses_without_a_token(self):
+        self.assertNotEqual(self.push().returncode, 0)
+
+    def test_prepush_refuses_an_expired_token(self):
+        self.ask()
+        tok = json.loads(self.token.read_text())
+        tok["expires"] -= 120
+        self.token.write_text(json.dumps(tok))
+        self.assertNotEqual(self.push().returncode, 0)
+
+    def test_prepush_refuses_when_the_sha_differs(self):
+        self.ask()
+        self.commit()
+        self.assertNotEqual(self.push().returncode, 0)
+
+    def test_prepush_refuses_a_different_ref(self):
+        self.ask()
+        r = run(self.repo, "git", "push", "-q", "origin", "HEAD:refs/heads/other", env=claude_env())
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_drift_removes_a_leftover_token(self):
+        self.ask()
+        subprocess.run([sys.executable, str(DRIFT)], env=ENV, capture_output=True, text=True,
+                       input=json.dumps({"tool_name": "Bash", "cwd": str(self.repo)}))
+        self.assertFalse(self.token.exists())
+
+    def test_inline_allow_push_is_still_refused(self):
+        r = gate(self.repo, "Bash", {"command": "SDLC_ALLOW_PUSH=1 git push"})
+        self.assertEqual(r.returncode, 2)
+        self.assertFalse(self.token.exists())
 
 
 class TestV2Layers(Repo):

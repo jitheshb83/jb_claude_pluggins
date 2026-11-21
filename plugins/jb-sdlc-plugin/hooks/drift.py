@@ -25,6 +25,8 @@ def main() -> None:
     except ValueError:
         return
     root = sdlc.repo_root(Path(event.get("cwd") or os.getcwd()))
+    if root:
+        sdlc.clear_push_token(root)  # an approval covers one command only
     feat = sdlc.active_feature(root) if root else None
     if not feat or feat.get("_corrupt") or feat.get("_missing"):
         return

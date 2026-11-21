@@ -8,9 +8,11 @@ the repository's own hook of the same name, so existing hooks keep running.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -23,11 +25,29 @@ def refuse(msg: str) -> None:
     sys.exit(1)
 
 
+def approved_push(root: Path, data: bytes) -> bool:
+    """True if the gate's one-shot token (written when the user was asked) covers every pushed ref."""
+    path = sdlc.push_token_path(root)
+    try:
+        tok = json.loads(path.read_text()) if path else {}
+        if time.time() > float(tok["expires"]):
+            path.unlink(missing_ok=True)
+            return False
+        allowed = {(p["ref"], p["sha"]) for p in tok["pushes"]}
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    lines = [l.split() for l in data.decode(errors="replace").splitlines() if l.strip()]
+    if not lines or any(len(p) != 4 or (p[2], p[1]) not in allowed for p in lines):
+        return False
+    path.unlink(missing_ok=True)
+    return True
+
+
 def enforce(name: str, root: Path, data: bytes = b"") -> None:
     if os.environ.get("CLAUDECODE") != "1" or os.environ.get("SDLC_GATES", "").lower() in ("off", "0", "false"):
         return
     allow_push = os.environ.get("SDLC_ALLOW_PUSH", "").lower() in ("1", "true", "yes")
-    if name == "pre-push" and not allow_push:
+    if name == "pre-push" and not allow_push and not approved_push(root, data):
         refuse("the SDLC never pushes. The user pushes from their own terminal, or in Claude Code "
                "with `! SDLC_ALLOW_PUSH=1 git push ...`.")
     feat = sdlc.active_feature(root)

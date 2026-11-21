@@ -10,8 +10,12 @@ Edit/Write/MultiEdit/NotebookEdit
   docs/sdlc/*/state.json        -> always refused; only sdlc.py writes approvals
   code outside docs/sdlc        -> refused until the branch's spec+plan are approved
 Bash (pattern checks, not a shell parser)
-  gh pr create|merge, gh api writes to pulls/merges, git push
-                                -> refused: the SDLC never publishes (SDLC_ALLOW_PUSH=1 lifts)
+  git push (plain, not forced, not to main/master), gh pr create
+                                -> "ask": the user confirms in the permission prompt; a push
+                                   also writes a 60s one-shot token the pre-push hook checks
+  gh pr merge, gh api writes to pulls/merges, forced/base-branch/delete pushes, anything
+  compound or not confidently classified
+                                -> refused (SDLC_ALLOW_PUSH=1, set by the user, lifts)
   switching the git hooks off   -> refused: --no-verify, core.hooksPath, GIT_CONFIG_*,
                                    CLAUDECODE/SDLC_* assignments, env -i/-u
   git commit                    -> refused on main/master or a merged branch, and when it
@@ -31,6 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import sdlc  # noqa: E402
+from publish import ask_publish  # noqa: E402
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 _RAW = ""
@@ -162,6 +167,7 @@ def gate_bash(command: str, cwd: Path) -> None:
               "core.hooksPath, GIT_CONFIG_*, CLAUDECODE / SDLC_* changes, env -i). Only the user "
               "changes those, before the session starts.")
     if not allow_push:
+        ask_publish(command, cwd)
         if "push" in found:
             block("`git push` refused — the SDLC never pushes. Hand the user the push command "
                   "(`! SDLC_ALLOW_PUSH=1 git push ...` in Claude Code, or their own terminal).")

@@ -49,6 +49,8 @@ the user's step.
    ```
    `SDLC_ALLOW_PUSH=1` lets the session's git hooks pass the user's own push.
    Claude can't run this form: the gate refuses inline `SDLC_*` variables.
+   Alternatively, offer to run a plain `git push -u origin <branch>` or
+   `gh pr create` itself: the user confirms each in the permission prompt.
    Then remind them of two things:
    - After the PR merges, run `git checkout main && git pull`. The hook
      blocks further commits on this branch.
