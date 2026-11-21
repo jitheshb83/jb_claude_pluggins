@@ -1,7 +1,7 @@
 {
   "name": "jb-sdlc-plugin",
   "description": "Lean AI SDLC for any repo: Spec → Plan → Build (test-first) → Review → Ship, with committed per-feature artifacts and hook-enforced gates (no commits on main or merged branches, no code before an approved plan).",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": {
     "name": "Jithesh Bharathan",
     "url": "https://github.com/jitheshb83"

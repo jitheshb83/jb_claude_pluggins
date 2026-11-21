@@ -1099,6 +1099,48 @@ class TestAskBeforePublish(Repo):
         self.assertEqual(r.returncode, 2)
         self.assertFalse(self.token.exists())
 
+    def decision(self, r):
+        return json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] if r.stdout else None
+
+    def approve_plan(self):
+        cli(self.repo, "new", "Approved")
+        (self.feature_dir() / "plan.md").write_text(GOOD_PLAN_NODIAG)
+        cli(self.repo, "approve", "plan", "--note", "user: yes")
+
+    def test_pr_create_with_parens_in_quoted_title_asks(self):
+        for cmd in ('gh pr create --title "feat(ci): x" --body-file f',
+                    "gh pr create --title 'fix(a); b & c | d <e>' --body-file f"):
+            self.assertEqual(self.decision(self.ask(cmd)), "ask", cmd)
+
+    def test_substitution_and_compound_pr_create_still_refused(self):
+        for cmd in ("gh pr create; rm x", 'gh pr create --title "$(id)"', 'gh pr create --title "`id`"',
+                    'gh pr create --title "a\\b"', "gh pr create --title feat(ci)", 'gh pr create --title "a" | cat',
+                    'gh pr create --title "unbalanced', 'gh pr create --title "a\nb"',
+                    'gh pr create --title "x" "y" ; id', "gh pr create --title 'x' && id"):
+            self.assertEqual(gate(self.repo, "Bash", {"command": cmd}).returncode, 2, cmd)
+
+    def test_plain_commit_asks(self):
+        self.approve_plan()
+        self.assertEqual(self.decision(self.ask('git commit -m "feat(x): y"')), "ask")
+        self.assertEqual(self.decision(self.ask("git commit -m msg")), "ask")
+
+    def test_refused_commit_is_not_downgraded_to_ask(self):
+        r = gate(self.repo, "Bash", {"command": 'git commit -m "feat(x): y"'})
+        self.assertEqual(r.returncode, 0)
+        cli(self.repo, "new", "Unapproved")
+        (self.repo / "n.py").write_text("n = 1\n")
+        sh(self.repo, "git", "add", ".")
+        r = gate(self.repo, "Bash", {"command": 'git commit -m "feat(x): y"'})
+        self.assertEqual((r.returncode, r.stdout), (2, ""))
+        sh(self.repo, "git", "checkout", "-q", "main")
+        r = gate(self.repo, "Bash", {"command": "git commit -m x"})
+        self.assertEqual((r.returncode, r.stdout), (2, ""))
+
+    def test_allow_push_env_adds_no_commit_prompt(self):
+        self.approve_plan()
+        r = gate(self.repo, "Bash", {"command": 'git commit -m "feat(x): y"'}, env={**ENV, "SDLC_ALLOW_PUSH": "1"})
+        self.assertEqual((r.returncode, r.stdout), (0, ""))
+
 
 class TestV2Layers(Repo):
     """v2: shell writes are caught by results (drift, tamper, git hooks), not by parsing."""

@@ -19,7 +19,8 @@ Bash (pattern checks, not a shell parser)
   switching the git hooks off   -> refused: --no-verify, core.hooksPath, GIT_CONFIG_*,
                                    CLAUDECODE/SDLC_* assignments, env -i/-u
   git commit                    -> refused on main/master or a merged branch, and when it
-                                   would commit code before plan approval
+                                   would commit code before plan approval; otherwise a plain
+                                   commit is an "ask" (SDLC_ALLOW_PUSH=1 skips the prompt)
 
 Exit 0 allows, exit 2 refuses (stderr goes to Claude). SDLC_GATES=off disables.
 On an internal error it refuses git/gh commands and allows everything else.
@@ -35,7 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import sdlc  # noqa: E402
-from publish import ask_publish  # noqa: E402
+from publish import ask_commit, ask_publish  # noqa: E402
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 _RAW = ""
@@ -169,12 +170,15 @@ def gate_bash(command: str, cwd: Path) -> None:
     if not allow_push:
         ask_publish(command, cwd)
         if "push" in found:
-            block("`git push` refused — the SDLC never pushes. Hand the user the push command "
+            block("`git push` refused — the SDLC never pushes except a plain feature-branch push "
+                  "the user confirms in the permission prompt (no force, no `;`/`&&`/`$(...)`). Run the plain `git push -u origin "
+                  "HEAD` so the user can confirm it, or hand them the command "
                   "(`! SDLC_ALLOW_PUSH=1 git push ...` in Claude Code, or their own terminal).")
         pr = GH_PR.search(scan)
         if pr or GH_API_WRITE.search(scan):
-            block(f"`gh {'pr ' + pr.group(1) if pr else 'api'}` refused — the SDLC never opens or "
-                  f"merges PRs. Hand the user the PR body file and the command.")
+            block(f"`gh {'pr ' + pr.group(1) if pr else 'api'}` refused — only a plain `gh pr create` "
+                  f"(no `;`/`&&`/`$(...)`) reaches the permission prompt; the SDLC never merges PRs. "
+                  f"Run it plain, or hand the user the PR body file and the command.")
 
     root = sdlc.repo_root(cwd)
     if root and CLEANS_UNTRACKED.search(scan):
@@ -197,6 +201,8 @@ def gate_bash(command: str, cwd: Path) -> None:
             reason = approval_block(root, feat, f"code commits ({', '.join(code[:3])})") if code else None
             if reason:
                 block(f"`git commit` refused — {reason}")
+        if not allow_push:
+            ask_commit(command)
 
 
 def main() -> None:
