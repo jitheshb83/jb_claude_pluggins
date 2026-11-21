@@ -18,21 +18,25 @@ def subtract(a, b):
     return a - b
 PY
 mkdir -p tests
+touch tests/__init__.py
 cat > tests/test_calc.py <<'PY'
+import unittest
+
 from calc import add, subtract
 
 
-def test_add():
-    assert add(2, 3) == 5
+class CalcTest(unittest.TestCase):
+    def test_add(self):
+        self.assertEqual(add(2, 3), 5)
 
-
-def test_subtract():
-    assert subtract(5, 3) == 2
+    def test_subtract(self):
+        self.assertEqual(subtract(5, 3), 2)
 PY
 echo "# calc" > README.md
 git add -A && git commit -qm "initial calc"
-git init -q --bare "$TMPDIR/eval-remote.git"
-git remote add origin "$TMPDIR/eval-remote.git"
+remote="$(mktemp -d "${TMPDIR:-/tmp}/sdlc-eval.XXXXXX")/remote.git"
+git init -q --bare "$remote"
+git remote add origin "$remote"
 git push -q -u origin main
 git checkout -q -b feature/work
 

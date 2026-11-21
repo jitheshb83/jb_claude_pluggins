@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -48,8 +49,9 @@ GH_API_WRITE = re.compile(
     r"(?=[^;&|\n]*(?:(?:-X|--method)[\s=]*(?:POST|PUT|PATCH|DELETE)\b|\s(?:-f|-F|--field|--raw-field|--input)\b))",
     re.I)
 # Flag forms: matched on the raw text, since their values are often quoted.
+
 HOOK_FLAGS = re.compile(
-    r"\s[\"']?--no-ver[\w-]*|\s-c\s*[\"']?core\.hookspath"
+    r"\s-c\s*[\"']?core\.hookspath"
     r"|\bconfig\b(?![^;&|\n]*--get)[^;&|\n]*\bcore\.hookspath|--config-env", re.I)
 # Environment changes: matched on quote-masked text, so quoted mentions stay data.
 HOOK_OFF = re.compile(
@@ -150,7 +152,12 @@ def gate_bash(command: str, cwd: Path) -> None:
     scan = text if RUNS_TEXT.search(text) else mask_quotes(text)
     found = {m.group(1) for m in GIT_SUB.finditer(scan)}
 
-    if HOOK_OFF.search(scan) or HOOK_FLAGS.search(text):
+    try:  # exact shell words: a quoted "--no-verify" is still a flag, a -m message isn't
+        words = shlex.split(text)
+    except ValueError:
+        words = text.split()
+    no_verify = any(w.startswith("--no-v") and "--no-verify".startswith(w.split("=")[0]) for w in words)
+    if HOOK_OFF.search(scan) or HOOK_FLAGS.search(text) or no_verify:
         block("refused: this would switch the SDLC git hooks or gates off (--no-verify, "
               "core.hooksPath, GIT_CONFIG_*, CLAUDECODE / SDLC_* changes, env -i). Only the user "
               "changes those, before the session starts.")

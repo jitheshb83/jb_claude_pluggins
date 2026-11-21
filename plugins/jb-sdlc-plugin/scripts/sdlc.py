@@ -120,7 +120,7 @@ def _merged_pr(root: Path, branch: str) -> int | None:
     return pick_merged(prs, _branch_created(root, branch))
 
 
-def _had_own_commits(root: Path, branch: str) -> bool:
+def _had_own_commits(root: Path, branch: str, base: str | None = None) -> bool:
     """True if anything was ever committed on this branch (reflog evidence).
     A freshly created branch, pushed or not, has only a 'branch: Created' entry."""
     log = git(root, "reflog", "show", "--format=%gs", f"refs/heads/{branch}") or ""
@@ -128,7 +128,7 @@ def _had_own_commits(root: Path, branch: str) -> bool:
     lines = log.splitlines()
     def from_remote_feature(ln: str) -> bool:  # e.g. "Created from origin/feature/x", not origin/main
         src = ln.split("from", 1)[1].strip()
-        return "/" in src and src.split("/", 1)[1] not in BASE_BRANCHES | {"HEAD"}
+        return "/" in src and src.split("/", 1)[1] not in BASE_BRANCHES | {"HEAD", base or default_base(root)}
     return any(ln.startswith(own) for ln in lines) or any(
         ln.startswith("branch: Created from") and from_remote_feature(ln) for ln in lines)
 
@@ -170,7 +170,7 @@ def check_branch(root: Path, base: str | None = None) -> str | None:
 
     upstream = git(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
     ref = _base_ref(root, base)
-    if upstream and ref and _had_own_commits(root, branch):
+    if upstream and ref and _had_own_commits(root, branch, base):
         ahead = git(root, "rev-list", "--count", f"{ref}..HEAD")
         if ahead == "0" and git(root, "rev-list", "--count", f"{upstream}..HEAD") == "0":
             return (f"'{branch}' was pushed but has no commits that aren't already in "
@@ -382,13 +382,17 @@ def dirty_code(root: Path, store: bool = False) -> dict[str, str]:
         i += 1
         if len(entry) < 4:
             continue
-        if entry[0] in "RC" or entry[1] in "RC":
-            i += 1  # next field is the rename/copy source, without a status prefix
+        if (entry[0] in "RC" or entry[1] in "RC") and i < len(fields):
+            src = fields[i]  # next field: the rename/copy source, no status prefix
+            i += 1
+            if entry[0] == "R" and Path(src).parts[:2] != SDLC_DIR.parts:
+                out[src] = ""  # renamed away = deleted from its old path
         rel = entry[3:]
         if Path(rel).parts[:2] == SDLC_DIR.parts:
             continue
         out[rel] = ""
-    files = [r for r in out if (root / r).is_file()]
+    files = [r for r in out if (root / r).is_file() and out[r] != ""]
+    files += [r for r in out if out[r] == "" and (root / r).is_file()]
     if files:
         cmd = ["git", "-C", str(root), "hash-object", *(["-w"] if store else []), "--stdin-paths"]
         try:
@@ -504,6 +508,24 @@ def _tampered(state_file: Path) -> bool:
     return True
 
 
+def forged_states(root: Path, rev: str, paths: list[str]) -> list[str]:
+    """state.json paths whose content at `rev` (":" = index) is neither what sdlc.py
+    last wrote nor HEAD's copy — i.e. edited outside sdlc.py and about to be committed."""
+    rec, bad = _recorded(root), []
+    for rel in paths:
+        if not (rel.startswith(str(SDLC_DIR) + "/") and rel.endswith("/state.json")):
+            continue
+        blob = subprocess.run(["git", "-C", str(root), "show", f"{rev}{rel}" if rev == ":" else f"{rev}:{rel}"],
+                              capture_output=True)
+        if blob.returncode != 0:
+            continue  # deleted in this change
+        h = hashlib.sha256(blob.stdout).hexdigest()
+        head = subprocess.run(["git", "-C", str(root), "show", f"HEAD:{rel}"], capture_output=True)
+        if h != rec.get(rel) and not (head.returncode == 0 and hashlib.sha256(head.stdout).hexdigest() == h):
+            bad.append(rel)
+    return bad
+
+
 def load(state_file: Path) -> dict:
     """Parse a state.json. Anything unreadable, or changed outside sdlc.py, comes
     back as a *corrupt* state, which blocks code changes instead of opening gates."""
@@ -598,20 +620,21 @@ def active_feature(root: Path, branch: str | None = None) -> dict | None:
 
 
 def _feature_at_head(root: Path, branch: str, feats: list[dict]) -> dict | None:
-    """An open feature whose branch HEAD is on without being on it: a detached HEAD at
-    or past its tip, or a new branch created from its tip. Keeps the gate closed."""
-    if branch:  # a named branch has its own features (or none); only a detached HEAD borrows
-        return None
+    """An open feature this checkout carries without being on its branch: a detached
+    HEAD or a new branch at/after its tip (once it has commits of its own), or a feature
+    whose branch was renamed. Keeps the gate closed instead of dropping it."""
     base_ref = _base_ref(root, default_base(root))
     for s in feats:
         b = s.get("branch")
-        if not b or phase(s) == "done":
+        if not b or b == branch or phase(s) == "done" or s.get("_corrupt"):
             continue
         tip = git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}")
-        if not tip or (base_ref and git(root, "merge-base", "--is-ancestor", tip, base_ref) is not None):
-            continue  # no commits of its own yet: every rebase onto the base would match
+        if not tip:
+            return s  # its branch was renamed or deleted, but its folder is in this checkout
+        if base_ref and git(root, "merge-base", "--is-ancestor", tip, base_ref) is not None:
+            continue  # no commits of its own: a branch cut from the base isn't this feature
         if git(root, "merge-base", "--is-ancestor", tip, "HEAD") is not None:
-            return s
+            return s  # detached inside it, or a branch made from it
     return None
 
 
@@ -815,7 +838,6 @@ def cmd_approve(a) -> None:
         pr_md = s["_dir"] / "pr.md"
         if not pr_md.exists() or not pr_md.read_text().strip():
             sys.exit(f"sdlc: write {pr_md.relative_to(root)} (the PR description) first.")
-        entry["head"] = git(root, "rev-parse", "--short", "HEAD")
         if a.pr:
             entry["pr"] = a.pr
     prev = s.get("approvals", {}).get(ph)
@@ -835,7 +857,7 @@ def cmd_approve(a) -> None:
 def cmd_reopen(a) -> None:
     root = _root_or_die()
     s = _feature_or_die(root)
-    if a.phase in ("spec", "plan"):
+    if a.phase in ("spec", "plan") and approval_valid(s, "spec") and approval_valid(s, "plan"):
         save_baseline(root, s, approved=False)  # work done under the approval isn't drift
     for ph in PHASES[PHASES.index(a.phase):]:
         s.get("approvals", {}).pop(ph, None)
@@ -849,10 +871,12 @@ def cmd_track(a) -> None:
     s = _feature_or_die(root)
     if s.get("track") == a.track:
         sys.exit(f"sdlc: already on the {a.track} track.")
-    save_baseline(root, s, approved=False)
+    was_approved = approval_valid(s, "spec") and approval_valid(s, "plan")
     if a.track == "lite":
         if not (a.note or "").strip():
             sys.exit("sdlc: dropping to lite removes the spec gate — needs --note with the user's words.")
+    if was_approved:
+        save_baseline(root, s, approved=False)
         for ph in PHASES[PHASES.index("plan"):]:
             s.get("approvals", {}).pop(ph, None)  # the lite plan must carry the ACs and be re-approved
     s["track"] = a.track
@@ -899,10 +923,13 @@ def cmd_revert_drift(a) -> None:
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_bytes(subprocess.run(["git", "-C", str(root), "cat-file", "-p", h],
                                          capture_output=True, check=True).stdout)
+            if in_head:
+                git(root, "restore", "--staged", "--", rel)  # drop anything staged since
         elif in_head and h is None:  # clean at the baseline: back to HEAD, index included
             git(root, "restore", "--source=HEAD", "--staged", "--worktree", "--", rel)
-        else:  # created after the baseline, or deleted at it
-            git(root, "rm", "-q", "--cached", "--ignore-unmatch", "--", rel)
+        else:  # created after the baseline (unstage + delete), or deleted at it (delete)
+            if not in_head:
+                git(root, "rm", "-q", "--cached", "--ignore-unmatch", "--", rel)
             if f.is_file():
                 f.unlink()
         if rel in drift(root, s):

@@ -874,7 +874,8 @@ class TestFifthReview(Repo):
         sh(self.repo, "git", "commit", "-qm", "docs")
         sh(self.repo, "git", "mv", "app.py", "renamed.py")
         dirty = m.dirty_code(self.repo)
-        self.assertEqual(sorted(dirty), ["renamed.py"])
+        self.assertEqual(sorted(dirty), ["app.py", "renamed.py"])
+        self.assertEqual(dirty["app.py"], "")  # renamed away = deleted at its old path
 
 
 class TestSixthReview(Repo):
@@ -1166,6 +1167,78 @@ class TestFinalReview(Repo):
             self.assertIn("sdlc skill", route(self.repo, p).stdout, p)
         for p in ("what does this function do?", "thanks", "explain the gate", "List the developer settings"):
             self.assertEqual(route(self.repo, p).stdout, "", p)
+
+
+class TestConfirmationReview(Repo):
+    """Second (last) fix round."""
+
+    def test_feature_branch_moved_onto_code_from_detached_commit(self):  # 1
+        env = claude_env()
+        cli(self.repo, "new", "Det2")
+        sh(self.repo, "git", "add", "-A")
+        run(self.repo, "git", "commit", "-qm", "docs", env=env)
+        sh(self.repo, "git", "checkout", "-q", "--detach")
+        (self.repo / "app.py").write_text("x = 8\n")
+        sh(self.repo, "git", "commit", "-qam", "code while detached")  # plain git, as if hooks were skipped
+        r = run(self.repo, "git", "branch", "-f", "feature/det2", "HEAD", env=env)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no approved plan", r.stderr)
+
+    def test_renamed_or_branched_feature_keeps_its_gate(self):  # 2
+        cli(self.repo, "new", "Keep")
+        sh(self.repo, "git", "add", "-A")
+        sh(self.repo, "git", "commit", "-qm", "docs")
+        sh(self.repo, "git", "checkout", "-qb", "wip")
+        self.assertEqual(gate(self.repo, "Edit", {"file_path": str(self.repo / "app.py")}).returncode, 2)
+        sh(self.repo, "git", "checkout", "-q", "feature/keep")
+        sh(self.repo, "git", "branch", "-qD", "wip")
+        sh(self.repo, "git", "branch", "-m", "feature/keep", "feature/renamed")
+        self.assertEqual(gate(self.repo, "Edit", {"file_path": str(self.repo / "app.py")}).returncode, 2)
+
+    def test_reopen_while_unapproved_keeps_drift(self):  # 3
+        cli(self.repo, "new", "KeepDrift", "--track", "full")
+        (self.repo / "app.py").write_text("x = 'hacked'\n")
+        m = load_module(CLI, "sdlc_kd")
+        self.assertIn("app.py", m.drift(self.repo, m.active_feature(self.repo)))
+        cli(self.repo, "reopen", "spec")
+        self.assertIn("app.py", m.drift(self.repo, m.active_feature(self.repo)))
+
+    def test_develop_base_fresh_branch_is_not_stale(self):  # 4
+        sh(self.repo, "git", "checkout", "-qb", "develop")
+        sh(self.repo, "git", "push", "-qu", "origin", "develop")
+        sh(self.repo, "git", "remote", "set-head", "origin", "develop")
+        sh(self.repo, "git", "checkout", "-qb", "feature/d", "origin/develop")
+        self.assertFalse(gate(self.repo, "Bash", {"command": "git commit -m x"}).returncode == 2)
+
+    def test_forged_state_cannot_be_committed(self):  # 5
+        env = claude_env()
+        cli(self.repo, "new", "Forge2")
+        state = self.feature_dir() / "state.json"
+        state.write_text(state.read_text().replace('"approvals": {}', '"approvals": {"plan": {"sha256": "x"}}'))
+        run(self.repo, "git", "add", "-A", env=env)
+        r = run(self.repo, "git", "commit", "-qm", "docs", env=env)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("edited outside sdlc.py", r.stderr)
+
+    def test_syncing_from_base_is_allowed_before_approval(self):  # 9
+        env = claude_env()
+        cli(self.repo, "new", "Sync")
+        sh(self.repo, "git", "add", "-A")
+        run(self.repo, "git", "commit", "-qm", "docs", env=env)
+        other = Path(self.tmp.name) / "upstream-sync"
+        sh(Path(self.tmp.name), "git", "clone", "-q", str(self.remote), str(other))
+        (other / "base.py").write_text("b = 1\n")
+        sh(other, "git", "add", ".")
+        sh(other, "git", "commit", "-qm", "base moved")
+        sh(other, "git", "push", "-q", "origin", "main")
+        sh(self.repo, "git", "fetch", "-q")
+        r = run(self.repo, "git", "merge", "-q", "--no-edit", "origin/main", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_no_verify_in_a_message_is_data(self):  # 10
+        sh(self.repo, "git", "checkout", "-qb", "feature/x")
+        self.assertFalse(gate(self.repo, "Bash", {"command": 'git commit -m "gate: refuse --no-verify"'}).returncode == 2)
+        self.assertTrue(gate(self.repo, "Bash", {"command": "git commit --no-verify -m x"}).returncode == 2)
 
 
 class TestBranchGate(Repo):

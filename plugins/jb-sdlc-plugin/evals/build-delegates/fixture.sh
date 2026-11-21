@@ -18,21 +18,25 @@ def subtract(a, b):
     return a - b
 PY
 mkdir -p tests
+touch tests/__init__.py
 cat > tests/test_calc.py <<'PY'
+import unittest
+
 from calc import add, subtract
 
 
-def test_add():
-    assert add(2, 3) == 5
+class CalcTest(unittest.TestCase):
+    def test_add(self):
+        self.assertEqual(add(2, 3), 5)
 
-
-def test_subtract():
-    assert subtract(5, 3) == 2
+    def test_subtract(self):
+        self.assertEqual(subtract(5, 3), 2)
 PY
 echo "# calc" > README.md
 git add -A && git commit -qm "initial calc"
-git init -q --bare "$TMPDIR/eval-remote.git"
-git remote add origin "$TMPDIR/eval-remote.git"
+remote="$(mktemp -d "${TMPDIR:-/tmp}/sdlc-eval.XXXXXX")/remote.git"
+git init -q --bare "$remote"
+git remote add origin "$remote"
 git push -q -u origin main
 git checkout -q -b feature/work
 
@@ -57,14 +61,14 @@ cat > docs/sdlc/2026-01-01-divide/plan.md <<'PLAN'
 | tests/test_calc.py | add two tests |
 
 ## Steps
-1. Write the two failing tests, then implement divide (verify: python3 -m pytest -q)
+1. Write the two failing tests, then implement divide (verify: python3 -m unittest -q)
 
 ## Test plan
-| AC1 | tests/test_calc.py::test_divide | unit |
-| AC2 | tests/test_calc.py::test_divide_by_zero | unit |
+| AC1 | tests/test_calc.py::CalcTest.test_divide | unit |
+| AC2 | tests/test_calc.py::CalcTest.test_divide_by_zero | unit |
 
 ## Verification
-- `python3 -m pytest -q`
+- `python3 -m unittest -q`
 
 ## Decisions
 - error type -> ValueError (user)

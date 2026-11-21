@@ -52,6 +52,8 @@ def enforce(name: str, root: Path, data: bytes = b"") -> None:
             if b in bases and parts[1] not in remotes:
                 refuse(f"refusing to move '{b}' to a commit no remote has: the SDLC never changes "
                        f"the base branch, it only fast-forwards it to a remote's {b}.")
+            owner = next((f for f in sdlc.all_features(root) if f.get("branch") == b
+                          and not f.get("_corrupt") and sdlc.phase(f) != "done"), None)
             if parts[2] == current and b not in bases and set(parts[1]) != {"0"}:
                 # Any new commit on the current branch (commit, cherry-pick, revert, am,
                 # merge, rebase): never onto a merged branch. Local evidence only, so it's fast.
@@ -59,16 +61,30 @@ def enforce(name: str, root: Path, data: bytes = b"") -> None:
                 reason = sdlc.check_branch(root, (feat or {}).get("base"))
                 if reason:
                     refuse(reason)
-                # cherry-pick / am / revert / ff-merge / reset / commit -n never run pre-commit:
-                # check what the new commits change while the plan is unapproved.
-                if feat and not (sdlc.approval_valid(feat, "spec") and sdlc.approval_valid(feat, "plan")):
-                    old = parts[0] if set(parts[0]) != {"0"} else None
-                    changed = (sdlc.git(root, "diff", "--name-only", f"{old}..{parts[1]}") if old else
-                               sdlc.git(root, "show", "--name-only", "--format=", parts[1])) or ""
-                    code = [p for p in changed.splitlines() if Path(p).parts[:2] != sdlc.SDLC_DIR.parts]
+            gate_feat = owner or (feat if parts[2] == current else None)
+            if gate_feat and b not in bases and set(parts[1]) != {"0"}:
+                # Any way a feature branch moves (commit -n, cherry-pick, am, revert, ff-merge,
+                # reset, `branch -f`, `checkout -B` from a detached commit): check what it gains.
+                old = parts[0] if set(parts[0]) != {"0"} else None
+                changed = set(((sdlc.git(root, "diff", "--name-only", f"{old}..{parts[1]}") if old else
+                                sdlc.git(root, "show", "--name-only", "--format=", parts[1])) or "").splitlines())
+                forged = sdlc.forged_states(root, parts[1], sorted(changed))
+                if forged:
+                    refuse(f"{forged[0]} was edited outside sdlc.py; refusing to record it in a commit.")
+                if not (sdlc.approval_valid(gate_feat, "spec") and sdlc.approval_valid(gate_feat, "plan")):
+                    base_ref = sdlc._base_ref(root, gate_feat.get("base") or sdlc.default_base(root))
+                    if base_ref:  # syncing from the base isn't feature code
+                        changed &= set((sdlc.git(root, "diff", "--name-only", f"{base_ref}...{parts[1]}")
+                                        or "").splitlines())
+                    code = sorted(p for p in changed if Path(p).parts[:2] != sdlc.SDLC_DIR.parts)
                     if code:
-                        refuse(f"'{feat['title']}' has no approved plan; refusing to move the branch "
+                        refuse(f"'{gate_feat['title']}' has no approved plan; refusing to move '{b}' "
                                f"onto commits that change code ({', '.join(code[:3])}).")
+    if name == "pre-commit":
+        staged_all = (sdlc.git(root, "diff", "--cached", "--name-only") or "").splitlines()
+        forged = sdlc.forged_states(root, ":", staged_all)
+        if forged:
+            refuse(f"{forged[0]} was edited outside sdlc.py; refusing to commit it. Ask the user.")
     if name in ("pre-commit", "pre-merge-commit"):
         reason = sdlc.check_branch(root, (feat or {}).get("base"))
         if reason:
@@ -76,6 +92,10 @@ def enforce(name: str, root: Path, data: bytes = b"") -> None:
         if feat and (feat.get("_corrupt") or feat.get("_missing")
                      or not sdlc.approval_valid(feat, "spec") or not sdlc.approval_valid(feat, "plan")):
             staged = (sdlc.git(root, "diff", "--cached", "--name-only") or "").splitlines()
+            base_ref = sdlc._base_ref(root, feat.get("base") or sdlc.default_base(root))
+            if base_ref:  # content identical to the base came from syncing it in, not feature code
+                staged = [p for p in staged if sdlc.git(root, "rev-parse", "--verify", "--quiet", f":{p}")
+                          != sdlc.git(root, "rev-parse", "--verify", "--quiet", f"{base_ref}:{p}")]
             code = [p for p in staged if Path(p).parts[:2] != sdlc.SDLC_DIR.parts]
             if code:
                 refuse(f"'{feat['title']}' has no approved plan; refusing to commit code: "
