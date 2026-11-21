@@ -1116,7 +1116,10 @@ class TestAskBeforePublish(Repo):
         for cmd in ("gh pr create; rm x", 'gh pr create --title "$(id)"', 'gh pr create --title "`id`"',
                     'gh pr create --title "a\\b"', "gh pr create --title feat(ci)", 'gh pr create --title "a" | cat',
                     'gh pr create --title "unbalanced', 'gh pr create --title "a\nb"',
-                    'gh pr create --title "x" "y" ; id', "gh pr create --title 'x' && id"):
+                    'gh pr create --title "x" "y" ; id', "gh pr create --title 'x' && id",
+                    "gh pr create --title $'a\\'; id'", "gh pr create --title 'a\\' ; id ; '",
+                    "gh pr create --title \"it's\" ; id", "gh pr create <<< x", "gh pr create <(id)",
+                    "gh pr create --title \"a\"'\"' ; id '\"'"):
             self.assertEqual(gate(self.repo, "Bash", {"command": cmd}).returncode, 2, cmd)
 
     def test_plain_commit_asks(self):
@@ -1125,14 +1128,22 @@ class TestAskBeforePublish(Repo):
         self.assertEqual(self.decision(self.ask("git commit -m msg")), "ask")
 
     def test_refused_commit_is_not_downgraded_to_ask(self):
-        r = gate(self.repo, "Bash", {"command": 'git commit -m "feat(x): y"'})
-        self.assertEqual(r.returncode, 0)
         cli(self.repo, "new", "Unapproved")
         (self.repo / "n.py").write_text("n = 1\n")
         sh(self.repo, "git", "add", ".")
         r = gate(self.repo, "Bash", {"command": 'git commit -m "feat(x): y"'})
         self.assertEqual((r.returncode, r.stdout), (2, ""))
         sh(self.repo, "git", "checkout", "-q", "main")
+        r = gate(self.repo, "Bash", {"command": "git commit -m x"})
+        self.assertEqual((r.returncode, r.stdout), (2, ""))
+
+    def test_commit_on_merged_feature_branch_is_refused_not_asked(self):
+        self.commit("m.py")
+        sh(self.repo, "git", "push", "-qu", "origin", "feature/x")
+        sh(self.repo, "git", "checkout", "-q", "main")
+        sh(self.repo, "git", "merge", "--no-ff", "-q", "-m", "m", "feature/x")
+        sh(self.repo, "git", "push", "-q", "origin", "main")
+        sh(self.repo, "git", "checkout", "-q", "feature/x")
         r = gate(self.repo, "Bash", {"command": "git commit -m x"})
         self.assertEqual((r.returncode, r.stdout), (2, ""))
 

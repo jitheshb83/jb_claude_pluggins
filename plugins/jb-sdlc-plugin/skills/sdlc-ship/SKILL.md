@@ -38,8 +38,11 @@ the user's step.
    included, ending the message with the session's attribution lines:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/sdlc.py" approve ship
-   git add -A && git commit -m "<summary>"
+   git add -A
+   git commit -m "<summary>"
    ```
+   Run them as two separate plain commands with a single-line message and no
+   heredoc: a compound command skips the commit prompt.
 6. **Hand over** in five lines or fewer: the branch, the commit count, the
    verification status, and the publish step. Offer to run a plain
    `git push -u origin <branch>` and `gh pr create --base <base> --title "<title>" --body-file docs/sdlc/<feature>/pr.md`
