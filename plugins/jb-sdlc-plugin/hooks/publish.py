@@ -13,13 +13,47 @@ from pathlib import Path
 import sdlc
 
 SHELL_META = re.compile(r"[;&|<>`$()\\\n\r]")
+DQ_META = re.compile(r"[`$\\\n\r]")  # still run inside double quotes; ( ) ; & | < > are literal there
 PUSH_FLAGS = {"-u", "--set-upstream", "-q", "--quiet", "-v", "--verbose", "-n", "--dry-run"}
+
+
+def has_shell_meta(command: str) -> bool:
+    """True if the command could run more than one plain command. Single quotes are literal,
+    double quotes still expand $ ` and \\; an unbalanced quote counts as unsure."""
+    quote = ""
+    for ch in command:
+        if ch in "\n\r":
+            return True
+        if quote == "'":
+            quote = "" if ch == "'" else quote
+        elif quote == '"':
+            if ch == '"':
+                quote = ""
+            elif DQ_META.match(ch):
+                return True
+        elif ch in "'\"":
+            quote = ch
+        elif SHELL_META.match(ch):
+            return True
+    return bool(quote)
+
+
+def ask_commit(command: str) -> None:
+    """Ask the user for a plain `git commit`; returns for anything not confidently plain."""
+    if has_shell_meta(command):
+        return
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return
+    if words[:2] == ["git", "commit"]:
+        ask("`git commit` will record a commit on this branch.")
 
 
 def ask_publish(command: str, cwd: Path) -> None:
     """Ask the user (permission prompt) for a plain push of a feature branch or `gh pr create`.
     Returns for anything else, so the refusals below apply. Unsure means refuse."""
-    if SHELL_META.search(command):
+    if has_shell_meta(command):
         return
     try:
         words = shlex.split(command)

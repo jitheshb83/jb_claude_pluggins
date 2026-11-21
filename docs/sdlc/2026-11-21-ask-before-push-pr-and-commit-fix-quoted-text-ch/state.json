@@ -1,0 +1,59 @@
+{
+  "title": "Ask before push, PR and commit; fix quoted-text check",
+  "slug": "ask-before-push-pr-and-commit-fix-quoted-text-ch",
+  "track": "lite",
+  "branch": "feature/ask-before-push-pr-and-commit-fix-quoted-text-ch",
+  "base": "main",
+  "created": "2026-11-21T12:04:23+01:00",
+  "approvals": {
+    "plan": {
+      "at": "2026-11-21T12:06:21+01:00",
+      "note": "approved via AskUserQuestion: Approve (Recommended)",
+      "sha256": "764d63325516506e7ee189e46bf90ce2e094eab46d99b8c391c45ff40acdf029"
+    },
+    "build": {
+      "at": "2026-11-21T12:23:31+01:00",
+      "note": "",
+      "evidence": "python3 -m pytest tests -q: 122 passed (121 + 1 new); claude plugin validate .: passed (builder); commits 442e2dc, 6547d6e. Not verified: real Claude Code permission prompt"
+    },
+    "review": {
+      "at": "2026-11-21T12:23:33+01:00",
+      "note": "3 fixed, 2 deferred",
+      "sha256": "e93abea077610ed6706857b940dbc58b060279cd89899b2272e171f5ea50a308"
+    },
+    "ship": {
+      "at": "2026-11-21T12:23:47+01:00",
+      "note": ""
+    }
+  },
+  "history": [
+    {
+      "at": "2026-11-21T12:04:23+01:00",
+      "event": "created"
+    },
+    {
+      "at": "2026-11-21T12:06:21+01:00",
+      "event": "approved plan"
+    },
+    {
+      "at": "2026-11-21T12:15:16+01:00",
+      "event": "approved build"
+    },
+    {
+      "at": "2026-11-21T12:18:00+01:00",
+      "event": "reopened build: review fixes: user approved fixes 1, 2 and split ship step"
+    },
+    {
+      "at": "2026-11-21T12:23:31+01:00",
+      "event": "approved build"
+    },
+    {
+      "at": "2026-11-21T12:23:33+01:00",
+      "event": "approved review"
+    },
+    {
+      "at": "2026-11-21T12:23:47+01:00",
+      "event": "approved ship"
+    }
+  ]
+}
