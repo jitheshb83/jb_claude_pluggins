@@ -68,6 +68,20 @@ def default_base(root: Path) -> str:
     return "main"
 
 
+PUSH_TOKEN_TTL = 60
+
+
+def push_token_path(root: Path) -> Path | None:
+    gd = git(root, "rev-parse", "--absolute-git-dir")
+    return Path(gd) / "sdlc-push-ok" if gd else None
+
+
+def clear_push_token(root: Path) -> None:
+    p = push_token_path(root)
+    if p:
+        p.unlink(missing_ok=True)
+
+
 def _base_ref(root: Path, base: str) -> str | None:
     for ref in (f"origin/{base}", base):
         if git(root, "rev-parse", "--verify", "--quiet", ref) is not None:

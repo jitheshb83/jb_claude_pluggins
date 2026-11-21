@@ -71,9 +71,10 @@ These rules hold for every track, quick included:
    user's explicit approval of the plan as written. That includes quick
    tasks, re-plans after BLOCKED, and the fix list from review. `approve`
    requires `--note` with the user's words.
-5. **No publishing, ever.** The SDLC commits locally only. It never pushes,
-   opens or merges a PR, or merges into the base branch. The user does that,
-   with the commands `sdlc-ship` hands over. The hook enforces this.
+5. **Publishing is the user's call.** The SDLC commits locally and never
+   pushes or opens a PR on its own: a plain feature-branch `git push` or
+   `gh pr create` goes through the permission prompt, which the user confirms.
+   It never merges a PR or pushes to or merges into the base branch. The hook enforces this.
 
 ## 4. Cost rules (all phases)
 
